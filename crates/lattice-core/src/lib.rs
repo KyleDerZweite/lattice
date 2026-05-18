@@ -152,6 +152,47 @@ pub struct OpenFileSnapshot {
     pub content_hash: blake3::Hash,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub version: u32,
+    pub history_enabled: bool,
+    pub autosnapshot_idle_seconds: u64,
+    pub theme: ThemeMode,
+    pub editor_font_size: u32,
+    pub editor_font_family: String,
+    pub recent_vaults: Vec<PathBuf>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            history_enabled: true,
+            autosnapshot_idle_seconds: 60,
+            theme: ThemeMode::System,
+            editor_font_size: 14,
+            editor_font_family: "monospace".to_owned(),
+            recent_vaults: Vec::new(),
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn remember_vault(&mut self, path: PathBuf) {
+        self.recent_vaults.retain(|recent| recent != &path);
+        self.recent_vaults.insert(0, path);
+        self.recent_vaults.truncate(10);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    System,
+    Light,
+    Dark,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

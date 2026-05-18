@@ -30,6 +30,7 @@ fuzzy-matcher = "0.3"
 log = "0.4"
 notify = "6"
 ropey = "1.6"
+rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 similar = "2"
 thiserror = "2"
