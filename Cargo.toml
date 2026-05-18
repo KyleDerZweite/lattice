@@ -22,18 +22,16 @@ anyhow = "1"
 blake3 = { version = "1", features = ["serde"] }
 camino = { version = "1", features = ["serde1"] }
 clap = { version = "4", features = ["derive"] }
-directories = "5"
-eframe = "0.31"
-egui = "0.31"
+directories = "6"
+eframe = "0.34"
+egui = "0.34"
 env_logger = "0.11"
 fuzzy-matcher = "0.3"
 log = "0.4"
-notify = "6"
-ropey = "1.6"
-rfd = "0.15"
+notify = "8"
+rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
-similar = "2"
 thiserror = "2"
-toml = "0.8"
+toml = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"

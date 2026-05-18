@@ -36,14 +36,15 @@ impl InMemoryMarkdownIndex {
         self.links_by_file
             .iter()
             .flat_map(|(source, links)| {
-                links.iter().filter_map(|link| {
-                    (link.target == target).then(|| Backlink {
+                links
+                    .iter()
+                    .filter(|link| link.target == target)
+                    .map(|link| Backlink {
                         source: source.clone(),
                         target: target.to_owned(),
                         line: 0,
                         snippet: link.raw.clone(),
                     })
-                })
             })
             .collect()
     }

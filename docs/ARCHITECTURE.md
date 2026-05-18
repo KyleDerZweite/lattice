@@ -1,16 +1,18 @@
 # Architecture
 
-Lattice is a Rust workspace split by product boundaries:
+Lattice is a Rust workspace split by product boundaries. Phase 0/1 only
+implements the native app shell, settings, vault opening, and flat file listing;
+later crate boundaries intentionally stay API-empty until their phase starts.
 
 - `lattice-app`: executable, CLI, logging, panic handling, `eframe` startup, lifecycle, and platform integration.
 - `lattice-core`: shared IDs, errors, file metadata, settings types, and vault-relative path safety.
-- `lattice-workspace`: vault opening, ignored path handling, file tree, CRUD, watcher integration, quick open, and external change detection.
-- `lattice-editor`: rope-backed editor buffers and the native editing surface.
-- `lattice-markdown`: Markdown parsing, wikilinks, headings, tags, frontmatter, backlinks, and preview data.
-- `lattice-history`: app-managed Git-compatible snapshots under `.lattice/history.git`.
-- `lattice-diff`: native diff model and `egui` diff viewer support.
-- `lattice-graph`: note/link/tag graph data model and later native graph UI.
-- `lattice-ui`: shared panels, command surfaces, styling, and reusable widgets.
+- `lattice-workspace`: currently vault opening, ignored path handling, flat file listing, file reads, and atomic file creation. Planned: lazy tree loading, watcher integration, quick open, and external change detection.
+- `lattice-editor`: Phase 3 boundary for rope-backed editor buffers and the native editing surface.
+- `lattice-markdown`: currently wikilink extraction and an in-memory backlink sketch. Planned: headings, tags, frontmatter, backlinks, and preview data.
+- `lattice-history`: Phase 6 boundary for app-managed Git-compatible snapshots under `.lattice/history.git`.
+- `lattice-diff`: Phase 7 boundary for native diff models and `egui` diff viewer support.
+- `lattice-graph`: Phase 9 boundary for note/link/tag graph data and native graph UI.
+- `lattice-ui`: currently shared style setup. Planned: shared panels, command surfaces, and reusable widgets.
 
 The executable must not depend on npm, Tauri, Electron, WebView, or browser code. UI rendering is native `egui/eframe`.
 

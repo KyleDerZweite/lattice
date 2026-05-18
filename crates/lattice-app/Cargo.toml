@@ -9,16 +9,13 @@ name = "lattice"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace = true
 clap.workspace = true
 directories.workspace = true
 eframe.workspace = true
-egui.workspace = true
 env_logger.workspace = true
 lattice-core = { path = "../lattice-core" }
 lattice-ui = { path = "../lattice-ui" }
 lattice-workspace = { path = "../lattice-workspace" }
 log.workspace = true
 rfd.workspace = true
-serde.workspace = true
 toml.workspace = true

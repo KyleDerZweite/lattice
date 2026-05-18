@@ -15,6 +15,8 @@ pub enum LatticeError {
     UnsupportedPathPrefix(String),
     #[error("path is not valid UTF-8: {0}")]
     NonUtf8Path(String),
+    #[error("path must be absolute: {0}")]
+    NotAbsolutePath(String),
 }
 
 pub type Result<T> = std::result::Result<T, LatticeError>;
@@ -93,10 +95,12 @@ pub struct AbsolutePath {
 }
 
 impl AbsolutePath {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            absolute: path.into(),
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if !path.is_absolute() {
+            return Err(LatticeError::NotAbsolutePath(path.display().to_string()));
         }
+        Ok(Self { absolute: path })
     }
 
     pub fn as_path(&self) -> &Path {
@@ -213,5 +217,10 @@ mod tests {
     fn rejects_escaping_paths() {
         assert!(VaultPath::try_from("../secret.md").is_err());
         assert!(VaultPath::try_from("notes/../../secret.md").is_err());
+    }
+
+    #[test]
+    fn absolute_path_rejects_relative_paths() {
+        assert!(AbsolutePath::new("notes").is_err());
     }
 }

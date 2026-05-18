@@ -5,6 +5,3 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3.workspace = true
-lattice-core = { path = "../lattice-core" }
-ropey.workspace = true
