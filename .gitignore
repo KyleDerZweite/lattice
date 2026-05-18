@@ -1,0 +1,13 @@
+/target/
+/dist/
+/build/
+/out/
+/.cache/
+/.idea/
+/.vscode/
+*.log
+*.core
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db

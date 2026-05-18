@@ -1,0 +1,10 @@
+[package]
+name = "lattice-editor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+lattice-core = { path = "../lattice-core" }
+ropey.workspace = true
