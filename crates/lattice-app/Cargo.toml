@@ -9,11 +9,13 @@ name = "lattice"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 clap.workspace = true
 directories.workspace = true
 eframe.workspace = true
 env_logger.workspace = true
 lattice-core = { path = "../lattice-core" }
+lattice-editor = { path = "../lattice-editor" }
 lattice-ui = { path = "../lattice-ui" }
 lattice-workspace = { path = "../lattice-workspace" }
 log.workspace = true

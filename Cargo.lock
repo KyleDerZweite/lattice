@@ -1935,11 +1935,13 @@ dependencies = [
 name = "lattice-app"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "directories",
  "eframe",
  "env_logger",
  "lattice-core",
+ "lattice-editor",
  "lattice-ui",
  "lattice-workspace",
  "log",
@@ -1965,6 +1967,10 @@ version = "0.1.0"
 [[package]]
 name = "lattice-editor"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lattice-core",
+]
 
 [[package]]
 name = "lattice-graph"
@@ -1993,6 +1999,7 @@ name = "lattice-workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "camino",
  "fuzzy-matcher",
  "lattice-core",

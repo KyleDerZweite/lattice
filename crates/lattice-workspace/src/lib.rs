@@ -2,10 +2,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use lattice_core::OpenFileSnapshot;
 use lattice_core::{AbsolutePath, FileKind, VaultId, VaultPath};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +40,7 @@ pub struct TreeNode {
     pub kind: TreeNodeKind,
     pub expanded: bool,
     pub git_status: Option<GitStatus>,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,16 +218,48 @@ impl Workspace {
             );
         }
 
+        let entries = match fs::read_dir(&absolute) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                log::warn!("skipping unreadable directory {}", absolute.display());
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading directory {}", absolute.display()));
+            }
+        };
+
         let mut nodes = Vec::new();
-        for entry in fs::read_dir(&absolute)
-            .with_context(|| format!("reading directory {}", absolute.display()))?
-        {
-            let entry = entry?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    log::warn!(
+                        "skipping unreadable directory entry in {}",
+                        absolute.display()
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let entry_path = entry.path();
             if is_ignored_path(self.vault.root.as_path(), &entry_path) {
                 continue;
             }
-            let metadata = fs::symlink_metadata(&entry_path)?;
+            let metadata = match fs::symlink_metadata(&entry_path) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    log::warn!("skipping inaccessible path {}", entry_path.display());
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let relative = vault_relative_path(self.vault.root.as_path(), &entry_path)?;
             let name = relative
                 .file_name()
@@ -242,6 +276,7 @@ impl Workspace {
                 kind,
                 expanded: false,
                 git_status: None,
+                warning: directory_warning(&entry_path),
             });
         }
         nodes.sort_by(compare_tree_nodes);
@@ -256,7 +291,18 @@ impl Workspace {
             .into_iter()
             .filter_entry(|entry| !is_ignored(root, entry))
         {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if is_permission_denied_walkdir_error(&error) => {
+                    if let Some(path) = error.path() {
+                        log::warn!("skipping unreadable path {}", path.display());
+                    } else {
+                        log::warn!("skipping unreadable path");
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             if entry.path() == root || entry.file_type().is_dir() {
                 continue;
             }
@@ -271,6 +317,7 @@ impl Workspace {
                 kind: TreeNodeKind::File,
                 expanded: false,
                 git_status: None,
+                warning: None,
             });
         }
         nodes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -292,6 +339,19 @@ impl Workspace {
             bail!("refusing to read symlinked file: {}", path.as_str());
         }
         fs::read_to_string(absolute).with_context(|| format!("reading {}", path.as_str()))
+    }
+
+    pub fn open_file(&self, path: &VaultPath) -> Result<(String, OpenFileSnapshot)> {
+        let contents = self.read_file(path)?;
+        let snapshot = self
+            .file_snapshot(path)?
+            .ok_or_else(|| anyhow!("file disappeared while opening {}", path.as_str()))?;
+        Ok((contents, snapshot))
+    }
+
+    pub fn file_snapshot(&self, path: &VaultPath) -> Result<Option<OpenFileSnapshot>> {
+        let absolute = self.checked_absolute(path)?;
+        file_snapshot_at(&absolute)
     }
 
     pub fn create_file(&self, path: &VaultPath, contents: &str) -> Result<()> {
@@ -368,6 +428,25 @@ fn compare_tree_nodes(a: &TreeNode, b: &TreeNode) -> std::cmp::Ordering {
         .then_with(|| a.path.cmp(&b.path))
 }
 
+fn directory_warning(path: &Path) -> Option<String> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Some("Cannot read metadata".to_owned());
+    };
+    if metadata.file_type().is_symlink() {
+        return Some("Symlink not followed".to_owned());
+    }
+    if !metadata.is_dir() {
+        return None;
+    }
+    match fs::read_dir(path) {
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Some("Permission denied".to_owned())
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -380,6 +459,35 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     }
     fs::rename(&temp_path, path)?;
     Ok(())
+}
+
+fn file_snapshot_at(path: &Path) -> Result<Option<OpenFileSnapshot>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("refusing to snapshot symlinked file: {}", path.display());
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let contents = fs::read(path)?;
+    Ok(Some(OpenFileSnapshot {
+        modified_ms: modified_ms(&metadata),
+        size_bytes: metadata.len(),
+        content_hash: blake3::hash(&contents),
+    }))
+}
+
+fn modified_ms(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn sibling_temp_path(path: &Path) -> PathBuf {
@@ -421,6 +529,12 @@ fn vault_relative_path(root: &Path, path: &Path) -> Result<Utf8PathBuf> {
 
 fn is_ignored(root: &Path, entry: &DirEntry) -> bool {
     is_ignored_path(root, entry.path())
+}
+
+fn is_permission_denied_walkdir_error(error: &walkdir::Error) -> bool {
+    error
+        .io_error()
+        .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
 }
 
 pub fn is_ignored_path(root: &Path, path: &Path) -> bool {
@@ -518,6 +632,21 @@ mod tests {
     }
 
     #[test]
+    fn open_file_returns_content_snapshot() {
+        let root = temp_vault();
+        let workspace = Workspace::open_vault(root.clone()).unwrap();
+        let path = VaultPath::try_from("note.md").unwrap();
+
+        workspace.create_file(&path, "hello").unwrap();
+        let (contents, snapshot) = workspace.open_file(&path).unwrap();
+
+        assert_eq!(contents, "hello");
+        assert_eq!(snapshot.size_bytes, 5);
+        assert_eq!(snapshot.content_hash, blake3::hash(b"hello"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rename_and_delete_file() {
         let root = temp_vault();
         let workspace = Workspace::open_vault(root.clone()).unwrap();
@@ -563,6 +692,33 @@ mod tests {
             workspace.vault().root.as_path(),
             nested.canonicalize().unwrap()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_files_skips_permission_denied_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_vault();
+        let locked = root.join("data/postgres");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(root.join("note.md"), "visible").unwrap();
+        fs::write(locked.join("internal.md"), "hidden").unwrap();
+
+        let mut permissions = fs::metadata(&locked).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&locked, permissions).unwrap();
+
+        let workspace = Workspace::open_vault(root.clone()).unwrap();
+        let files = workspace.list_files().unwrap();
+        let paths: Vec<_> = files.iter().map(|file| file.path.as_str()).collect();
+
+        let mut permissions = fs::metadata(&locked).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&locked, permissions).unwrap();
+
+        assert_eq!(paths, vec!["note.md"]);
         fs::remove_dir_all(root).unwrap();
     }
 }
