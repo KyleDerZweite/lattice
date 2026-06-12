@@ -11,14 +11,13 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/kyle/lattice"
 
 [workspace.dependencies]
 anyhow = "1"
-blake3 = { version = "1", features = ["serde"] }
+blake3 = "1"
 cap-std = "4"
 cap-tempfile = "4"
-camino = { version = "1", features = ["serde1"] }
+camino = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 # glow (OpenGL) instead of the default wgpu renderer: same egui output, but no
@@ -43,7 +42,6 @@ rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "1"
-uuid = { version = "1", features = ["serde", "v4"] }
 
 # Fast, small binaries: full LTO + single codegen unit cost build time once,
 # but cut binary size and improve runtime perf for the editor hot loops.

@@ -9,4 +9,3 @@ blake3.workspace = true
 camino.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-uuid.workspace = true

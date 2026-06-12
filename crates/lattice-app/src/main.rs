@@ -2414,7 +2414,6 @@ fn replace_tree_children_inner(
                 return false;
             };
             node.kind = TreeNodeKind::DirectoryLoaded { children };
-            node.expanded = true;
             return true;
         }
         if let TreeNodeKind::DirectoryLoaded { children } = &mut node.kind {
@@ -3009,21 +3008,15 @@ mod tests {
                     path: child_path.clone(),
                     name: "child".to_owned(),
                     kind: TreeNodeKind::DirectoryUnloaded,
-                    expanded: false,
-                    git_status: None,
                     warning: None,
                 }],
             },
-            expanded: true,
-            git_status: None,
             warning: None,
         }];
         let replacement = vec![TreeNode {
             path: file_path,
             name: "note.md".to_owned(),
             kind: TreeNodeKind::File,
-            expanded: false,
-            git_status: None,
             warning: None,
         }];
 
@@ -3046,16 +3039,12 @@ mod tests {
                 path: duplicate.clone(),
                 name: "dup".to_owned(),
                 kind: TreeNodeKind::DirectoryUnloaded,
-                expanded: false,
-                git_status: None,
                 warning: None,
             },
             TreeNode {
                 path: duplicate.clone(),
                 name: "dup-again".to_owned(),
                 kind: TreeNodeKind::DirectoryUnloaded,
-                expanded: false,
-                git_status: None,
                 warning: None,
             },
         ];

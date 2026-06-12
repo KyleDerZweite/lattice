@@ -8,7 +8,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use lattice_core::OpenFileSnapshot;
-use lattice_core::{AbsolutePath, VaultId, VaultPath};
+use lattice_core::{AbsolutePath, VaultPath};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -33,7 +33,6 @@ pub const DEFAULT_IGNORES: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct Vault {
-    pub id: VaultId,
     pub root: AbsolutePath,
     pub name: String,
 }
@@ -43,8 +42,6 @@ pub struct TreeNode {
     pub path: VaultPath,
     pub name: String,
     pub kind: TreeNodeKind,
-    pub expanded: bool,
-    pub git_status: Option<GitStatus>,
     pub warning: Option<String>,
 }
 
@@ -53,16 +50,6 @@ pub enum TreeNodeKind {
     File,
     DirectoryLoaded { children: Vec<TreeNode> },
     DirectoryUnloaded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitStatus {
-    Clean,
-    Modified,
-    Added,
-    Deleted,
-    Renamed,
-    Untracked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,7 +249,6 @@ impl Workspace {
             .to_owned();
         Ok(Self {
             vault: Vault {
-                id: VaultId::default(),
                 root: AbsolutePath::new(root)?,
                 name,
             },
@@ -373,8 +359,6 @@ impl Workspace {
                 path: VaultPath::new(&relative)?,
                 name,
                 kind,
-                expanded: false,
-                git_status: None,
                 warning: self.directory_warning(&entry_relative),
             });
         }
@@ -446,8 +430,6 @@ impl Workspace {
                     .unwrap_or_else(|| relative.to_string()),
                 path,
                 kind: TreeNodeKind::File,
-                expanded: false,
-                git_status: None,
                 warning: None,
             });
         }

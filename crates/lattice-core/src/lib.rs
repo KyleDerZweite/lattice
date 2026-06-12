@@ -21,16 +21,7 @@ pub enum LatticeError {
 
 pub type Result<T> = std::result::Result<T, LatticeError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VaultId(pub uuid::Uuid);
-
-impl Default for VaultId {
-    fn default() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VaultPath {
     relative: Utf8PathBuf,
 }
@@ -89,7 +80,7 @@ impl TryFrom<&str> for VaultPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AbsolutePath {
     absolute: PathBuf,
 }
