@@ -108,47 +108,6 @@ impl AbsolutePath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum FileKind {
-    Markdown,
-    Image,
-    Pdf,
-    Json,
-    Yaml,
-    Toml,
-    Csv,
-    Other,
-}
-
-impl FileKind {
-    pub fn from_path(path: &Utf8Path) -> Self {
-        match path
-            .extension()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "md" | "markdown" => Self::Markdown,
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Self::Image,
-            "pdf" => Self::Pdf,
-            "json" => Self::Json,
-            "yaml" | "yml" => Self::Yaml,
-            "toml" => Self::Toml,
-            "csv" => Self::Csv,
-            _ => Self::Other,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileMeta {
-    pub path: VaultPath,
-    pub kind: FileKind,
-    pub modified_ms: u64,
-    pub size_bytes: u64,
-    pub content_hash: Option<blake3::Hash>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFileSnapshot {
     pub modified_ms: u64,
@@ -159,23 +118,21 @@ pub struct OpenFileSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub version: u32,
-    pub history_enabled: bool,
-    pub autosnapshot_idle_seconds: u64,
+    #[serde(default = "default_theme")]
     pub theme: ThemeMode,
-    pub editor_font_size: u32,
-    pub editor_font_family: String,
+    #[serde(default)]
     pub recent_vaults: Vec<PathBuf>,
+}
+
+fn default_theme() -> ThemeMode {
+    ThemeMode::System
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             version: 1,
-            history_enabled: true,
-            autosnapshot_idle_seconds: 60,
             theme: ThemeMode::System,
-            editor_font_size: 14,
-            editor_font_family: "monospace".to_owned(),
             recent_vaults: Vec::new(),
         }
     }

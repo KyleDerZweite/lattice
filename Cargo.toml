@@ -2,11 +2,7 @@
 members = [
     "crates/lattice-app",
     "crates/lattice-core",
-    "crates/lattice-diff",
     "crates/lattice-editor",
-    "crates/lattice-graph",
-    "crates/lattice-history",
-    "crates/lattice-markdown",
     "crates/lattice-ui",
     "crates/lattice-workspace",
 ]
@@ -20,18 +16,39 @@ repository = "https://github.com/kyle/lattice"
 [workspace.dependencies]
 anyhow = "1"
 blake3 = { version = "1", features = ["serde"] }
+cap-std = "4"
+cap-tempfile = "4"
 camino = { version = "1", features = ["serde1"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
-eframe = "0.34"
+# glow (OpenGL) instead of the default wgpu renderer: same egui output, but no
+# Vulkan/wgpu stack — smaller binary and a much lower resident memory footprint.
+eframe = { version = "0.34", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui = "0.34"
+egui_extras = { version = "0.34", default-features = false, features = ["syntect"] }
+egui_tiles = "0.15"
 env_logger = "0.11"
 fuzzy-matcher = "0.3"
+ignore = "0.4"
 log = "0.4"
 notify = "8"
+png = "0.18"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
-walkdir = "2"
+
+# Fast, small binaries: full LTO + single codegen unit cost build time once,
+# but cut binary size and improve runtime perf for the editor hot loops.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

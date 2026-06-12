@@ -1,31 +1,48 @@
 # Architecture
 
-Lattice is a Rust workspace split by product boundaries. Phase 0/1 only
-implements the native app shell, settings, vault opening, and flat file listing;
-later crate boundaries intentionally stay API-empty until their phase starts.
+Lattice is a Rust workspace split by product boundaries. Everything ships in one
+binary; there are no runtime plugins, services, or network dependencies. UI
+rendering is native `egui/eframe` — no npm, Tauri, Electron, WebView, or
+browser code.
 
-- `lattice-app`: executable, CLI, logging, panic handling, `eframe` startup, lifecycle, and platform integration.
-- `lattice-core`: shared IDs, errors, file metadata, settings types, and vault-relative path safety.
-- `lattice-workspace`: currently vault opening, ignored path handling, flat file listing, file reads, and atomic file creation. Planned: lazy tree loading, watcher integration, quick open, and external change detection.
-- `lattice-editor`: Phase 3 boundary for rope-backed editor buffers and the native editing surface.
-- `lattice-markdown`: currently wikilink extraction and an in-memory backlink sketch. Planned: headings, tags, frontmatter, backlinks, and preview data.
-- `lattice-history`: Phase 6 boundary for app-managed Git-compatible snapshots under `.lattice/history.git`.
-- `lattice-diff`: Phase 7 boundary for native diff models and `egui` diff viewer support.
-- `lattice-graph`: Phase 9 boundary for note/link/tag graph data and native graph UI.
-- `lattice-ui`: currently shared style setup. Planned: shared panels, command surfaces, and reusable widgets.
+- `lattice-app`: executable, CLI (`lattice [PATH]`, `--bench`), logging, panic
+  handling, `eframe` startup, and the whole UI: sidebar file tree + tabbed code
+  editor (split via `egui_tiles`), syntect syntax highlighting with a
+  line-number gutter, quick-open overlay, menu bar, status bar.
+- `lattice-core`: shared errors, settings types, and workspace-relative path
+  safety (`VaultPath` rejects absolute, escaping, and non-UTF-8 paths).
+- `lattice-workspace`: capability-scoped (`cap-std`) folder access, lazy
+  directory tree listing, parallel gitignore-aware file walking, fuzzy
+  quick-open index, `notify` file watcher, atomic writes, and blake3
+  content-hash snapshots for external-change/conflict detection.
+- `lattice-editor`: editor buffer model (text, dirty flag, saved snapshot).
+- `lattice-ui`: theme tokens (dark/light palettes mapped onto `egui::Style`)
+  and bundled Adwaita fonts.
 
-The executable must not depend on npm, Tauri, Electron, WebView, or browser code. UI rendering is native `egui/eframe`.
+## Threading model
 
-## Data Ownership
+The UI thread never does filesystem I/O. `lattice-app` spawns one worker thread
+per opened workspace; commands (load tree, open/save/create/rename/delete,
+build quick-open index, check external changes) flow over an mpsc channel and
+responses are drained on the UI thread, capped per frame. Responses carry a
+workspace generation so stale results from a previously opened folder are
+dropped. The parallel file walker uses its own short-lived threads.
 
-Plain files in the selected vault are canonical. Lattice metadata stays in `.lattice/`. Index and cache data must be rebuildable. Local history is stored in `.lattice/history.git` by default, even when the vault already has a user `.git`.
+## Safety boundaries
 
-## Safety Boundaries
+All workspace-facing APIs use `VaultPath` for root-relative paths. The
+workspace layer refuses to follow symlinks out of the opened folder.
 
-All vault-facing APIs use `VaultPath` for vault-relative paths. `VaultPath` rejects absolute paths and `..` components. The workspace layer must not follow symlinks outside the vault unless a later explicit setting allows it.
+File writes are atomic: write a sibling temp file, flush it, rename over the
+target, then refresh metadata and content hash. Saves compare the on-disk
+snapshot against the buffer's base snapshot and surface a conflict instead of
+clobbering external edits.
 
-File writes are atomic: write a sibling temp file, flush it, rename over the target, refresh metadata and content hash, then debounce self-generated watcher events.
+## Performance guards
 
-## Ferrite Relationship
-
-Ferrite is an audited MIT-licensed implementation reference. Lattice may selectively adapt code with attribution, but it removes terminal, shell execution, update-checking network calls, and broad code-editor features from the default product.
+- Syntax highlighting is memoized by egui and skipped entirely above 1 MiB.
+- Files over 10 MB show a slow-edit warning.
+- The directory tree loads lazily per expanded directory; the watcher watches
+  only the root and expanded directories, non-recursively.
+- Tree refreshes and external-change checks are debounced (250 ms).
+- Release builds use fat LTO, one codegen unit, and stripped symbols.

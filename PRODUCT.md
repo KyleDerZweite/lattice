@@ -1,50 +1,47 @@
 # Lattice
 
-Lattice is a native Rust Markdown knowledge workspace for people who want plain-file notes, fast local editing, backlinks, recoverable history, and a graph-oriented model without Electron, WebView, accounts, remote sync, or plugin complexity.
+Lattice is a fast, native code editor written in Rust. It is for people who want a VSCode-style editing experience — file tree, tabs, fuzzy file open, syntax highlighting — without Electron, WebView, integrated AI, extensions, accounts, telemetry, or plugin complexity.
 
-The product is vault-first, Markdown-first, local-first, performance-focused, and security-conscious. Plain files are canonical. App metadata lives under `.lattice/`, derived indexes are rebuildable, and app-managed history uses `.lattice/history.git` by default so an existing user `.git` repository is not polluted.
+The product is local-first, performance-focused, and security-conscious. Plain files are canonical; the app never executes file content, shell commands, plugins, or network sync.
 
 ## Product Goal
 
-Build a simple, native Markdown workspace that can be used daily as a local editor and can later grow into graph, packaging, and optional sync capabilities.
+Build a minimal, native code editor that can be used daily, starts instantly, and stays light on memory and CPU.
 
 The core promise:
 
-- Your notes are plain Markdown files.
-- Your local history is visible and recoverable.
-- Your existing Git repository is untouched by default.
-- Your graph and indexes can be rebuilt from the vault.
-- The app does not execute note content, shell commands, plugins, or network sync by default.
+- Open a folder, see its file tree (gitignore-aware), edit files.
+- Syntax highlighting for common languages, line numbers, tabs, autosave.
+- Safe saves: atomic writes, external-change detection, conflict resolution.
+- Fuzzy quick open (Ctrl+P) over the whole workspace.
+- No AI, no extensions, no network, no background services.
 
-## Current Direction
+## Architecture
 
-Lattice is being rebuilt as a Rust-native desktop app using `egui/eframe`. Ferrite is the audited working reference for editor, workspace, and Markdown ideas, with MIT attribution where code is adapted. Pierre Trees and Pierre Diffs are product design references only. Pretext and Code Storage are not runtime dependencies for the first rewrite.
+A Rust workspace of small crates on `egui/eframe`:
 
-## First Usable Release
+- `lattice-core` — path safety (`VaultPath` cannot escape the workspace root), settings.
+- `lattice-workspace` — capability-scoped (`cap-std`) file access, lazy directory tree, parallel gitignore-aware walker, fuzzy quick-open index, file watcher, atomic writes with content-hash snapshots.
+- `lattice-editor` — editor buffer model (dirty tracking, saved-snapshot hashes).
+- `lattice-ui` — theme tokens and bundled fonts.
+- `lattice-app` — the eframe app: sidebar tree + tabbed editor (egui_tiles), syntect highlighting, status bar, quick open, background worker thread for all I/O.
 
-The first release is done when a user can:
+All filesystem work runs on a worker thread; the UI thread never blocks on I/O. Syntax highlighting is memoized and skipped above 1 MiB; files over 10 MB get a slow-edit warning.
 
-- Launch a native Linux app.
-- Open a folder vault.
-- Create, edit, rename, and delete Markdown notes.
-- Save safely with atomic writes and conflict detection.
-- Use `[[wikilinks]]` to open or create notes.
-- See backlinks for the current note.
-- Preview Markdown, Mermaid, images, and PDFs offline.
-- Store local snapshots under `.lattice/history.git`.
-- View file history and diffs.
-- Restore one file from history.
+## Done When
 
-Graph view, packaging polish, Windows support, and optional remote sync follow after the editor, workspace, history, and diff core are stable.
+- Launch a native Linux app from a folder path or picker.
+- Browse a lazy, gitignore-aware file tree; create, rename, delete files.
+- Edit with syntax highlighting, line numbers, multiple tabs, autosave.
+- Save safely with atomic writes and conflict detection against external edits.
+- Quick-open any file with fuzzy search.
 
-## Non-Goals For The First Release
+## Non-Goals
 
+- Integrated AI of any kind.
+- Extensions/plugins, plugin execution.
 - WebView or browser frontend runtime.
-- npm runtime dependency.
-- Network access by default.
-- Automatic remote sync.
-- Plugin execution.
+- Network access, telemetry, accounts, remote sync.
 - Terminal or shell pipeline features.
-- Runnable code blocks.
-- Realtime collaboration.
-- Writing snapshots into a user's existing `.git` by default.
+- Runnable code blocks; realtime collaboration.
+- Language servers and debuggers (may be revisited much later; not now).

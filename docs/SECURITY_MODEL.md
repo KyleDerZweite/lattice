@@ -8,31 +8,24 @@ Lattice defaults to local, inert, user-controlled behavior.
 - No auto-update HTTP requests.
 - No terminal.
 - No shell command execution.
-- No plugin runtime.
+- No plugin or extension runtime.
 - No runnable code blocks.
-- No Mermaid JavaScript runtime.
-- No remote Git push or pull.
-- No arbitrary external path opening from note links without confirmation.
+- No integrated AI.
 
 ## Filesystem Access
 
 Allowed access is limited to:
 
-- The selected vault.
-- The app config directory.
-- Temporary files needed for atomic writes or exports.
-- An explicitly chosen export path.
+- The selected workspace folder (opened through `cap-std`, so all file
+  operations are capability-scoped to that directory handle).
+- The app config directory (settings only).
+- Sibling temporary files needed for atomic writes.
 
-Vault-relative paths must use `VaultPath`, which rejects absolute paths and `..`. Symlinks are not followed outside the vault by default.
+Workspace-relative paths must use `VaultPath`, which rejects absolute paths and
+`..`. Symlinks are never followed outside the workspace: every path component
+is checked before open, save, rename, and delete.
 
-## Markdown Rendering
+## File Content
 
-Markdown rendering should use a native render model. HTML scripts are never executed. Raw HTML, if supported later, must render inertly or behind an explicit setting.
-
-## PDF Handling
-
-PDFs are untrusted documents. Lattice should use a pure Rust viewing path where practical and must not support embedded JavaScript execution.
-
-## Git History
-
-Lattice uses an app-owned repository under `.lattice/history.git` by default. `.lattice/` and `.git/` are ignored by history. Existing user Git repositories are not modified unless a later expert mode explicitly enables that behavior.
+Opened files are treated as inert text. Lattice never executes, evaluates, or
+renders file content as anything other than syntax-highlighted text.

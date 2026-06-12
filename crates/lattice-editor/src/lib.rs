@@ -28,17 +28,6 @@ impl EditorBuffer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditorAction {
-    Save,
-    SaveAs,
-    ReloadFromDisk,
-    OverwriteDisk,
-    OpenLinkUnderCursor,
-    RenameCurrentFile,
-    CloseTab,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

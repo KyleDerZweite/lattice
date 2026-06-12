@@ -7,9 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+cap-std.workspace = true
+cap-tempfile.workspace = true
 camino.workspace = true
 fuzzy-matcher.workspace = true
+ignore.workspace = true
 lattice-core = { path = "../lattice-core" }
 log.workspace = true
 notify.workspace = true
-walkdir.workspace = true

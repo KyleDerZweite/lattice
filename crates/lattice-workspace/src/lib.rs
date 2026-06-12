@@ -1,16 +1,21 @@
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, Metadata, OpenOptions};
+use cap_tempfile::TempFile;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use ignore::overrides::OverrideBuilder;
+use ignore::WalkBuilder;
 use lattice_core::OpenFileSnapshot;
-use lattice_core::{AbsolutePath, FileKind, VaultId, VaultPath};
+use lattice_core::{AbsolutePath, VaultId, VaultPath};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{SystemTime, UNIX_EPOCH};
-use walkdir::{DirEntry, WalkDir};
 
 pub const DEFAULT_IGNORES: &[&str] = &[
     ".git",
@@ -73,10 +78,38 @@ pub struct QuickOpenIndex {
 
 impl QuickOpenIndex {
     pub fn rebuild(files: Vec<VaultPath>) -> Self {
-        Self { files }
+        let mut index = Self { files };
+        index.files.sort();
+        index.files.dedup();
+        index
+    }
+
+    pub fn replace_all(&mut self, files: Vec<VaultPath>) {
+        *self = Self::rebuild(files);
+    }
+
+    pub fn insert(&mut self, path: VaultPath) {
+        match self.files.binary_search(&path) {
+            Ok(_) => {}
+            Err(index) => self.files.insert(index, path),
+        }
+    }
+
+    pub fn remove(&mut self, path: &VaultPath) {
+        if let Ok(index) = self.files.binary_search(path) {
+            self.files.remove(index);
+        }
+    }
+
+    pub fn rename(&mut self, from: &VaultPath, to: VaultPath) {
+        self.remove(from);
+        self.insert(to);
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<QuickOpenMatch> {
+        if limit == 0 {
+            return Vec::new();
+        }
         if query.trim().is_empty() {
             return self
                 .files
@@ -88,18 +121,24 @@ impl QuickOpenIndex {
         }
 
         let matcher = SkimMatcherV2::default();
-        let mut matches: Vec<_> = self
-            .files
-            .iter()
-            .filter_map(|path| {
-                matcher
-                    .fuzzy_match(path.as_str(), query)
-                    .map(|score| QuickOpenMatch {
-                        path: path.clone(),
-                        score,
-                    })
-            })
-            .collect();
+        let mut matches = Vec::with_capacity(limit);
+        for path in &self.files {
+            let Some(score) = matcher.fuzzy_match(path.as_str(), query) else {
+                continue;
+            };
+            let candidate = QuickOpenMatch {
+                path: path.clone(),
+                score,
+            };
+            match matches
+                .binary_search_by(|existing| compare_quick_open_matches(existing, &candidate))
+            {
+                Ok(index) | Err(index) => matches.insert(index, candidate),
+            }
+            if matches.len() > limit {
+                matches.pop();
+            }
+        }
         matches.sort_by(|a, b| {
             b.score
                 .cmp(&a.score)
@@ -118,6 +157,12 @@ impl QuickOpenIndex {
     }
 }
 
+fn compare_quick_open_matches(a: &QuickOpenMatch, b: &QuickOpenMatch) -> std::cmp::Ordering {
+    b.score
+        .cmp(&a.score)
+        .then_with(|| a.path.as_str().cmp(b.path.as_str()))
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceEvent {
     pub kind: WorkspaceEventKind,
@@ -134,8 +179,10 @@ pub enum WorkspaceEventKind {
 }
 
 pub struct WorkspaceWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     receiver: Receiver<notify::Result<Event>>,
+    vault_root: PathBuf,
+    watched_paths: BTreeSet<PathBuf>,
 }
 
 impl WorkspaceWatcher {
@@ -144,21 +191,43 @@ impl WorkspaceWatcher {
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
         })?;
-        watcher.watch(vault_root, RecursiveMode::Recursive)?;
+        watcher.watch(vault_root, RecursiveMode::NonRecursive)?;
+        let mut watched_paths = BTreeSet::new();
+        watched_paths.insert(vault_root.to_path_buf());
         Ok(Self {
-            _watcher: watcher,
+            watcher,
             receiver,
+            vault_root: vault_root.to_path_buf(),
+            watched_paths,
         })
+    }
+
+    pub fn watch_path(&mut self, path: &Path) -> Result<()> {
+        if self.watched_paths.contains(path) {
+            return Ok(());
+        }
+        self.watcher.watch(path, RecursiveMode::NonRecursive)?;
+        self.watched_paths.insert(path.to_path_buf());
+        Ok(())
     }
 
     pub fn drain(&mut self) -> Vec<WorkspaceEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
             match event {
-                Ok(event) => events.push(WorkspaceEvent {
-                    kind: map_event_kind(&event.kind),
-                    paths: event.paths,
-                }),
+                Ok(event) => {
+                    let paths: Vec<_> = event
+                        .paths
+                        .into_iter()
+                        .filter(|path| !is_ignored_path(&self.vault_root, path))
+                        .collect();
+                    if !paths.is_empty() {
+                        events.push(WorkspaceEvent {
+                            kind: map_event_kind(&event.kind),
+                            paths,
+                        });
+                    }
+                }
                 Err(error) => log_notify_error(error),
             }
         }
@@ -168,6 +237,7 @@ impl WorkspaceWatcher {
 
 pub struct Workspace {
     vault: Vault,
+    root_dir: Dir,
 }
 
 impl Workspace {
@@ -183,6 +253,8 @@ impl Workspace {
         if !root.is_dir() {
             bail!("vault path is not a directory: {}", root.display());
         }
+        let root_dir = Dir::open_ambient_dir(&root, ambient_authority())
+            .with_context(|| format!("opening vault directory {}", root.display()))?;
         let name = root
             .file_name()
             .and_then(|name| name.to_str())
@@ -194,6 +266,14 @@ impl Workspace {
                 root: AbsolutePath::new(root)?,
                 name,
             },
+            root_dir,
+        })
+    }
+
+    pub fn try_clone_for_worker(&self) -> Result<Self> {
+        Ok(Self {
+            vault: self.vault.clone(),
+            root_dir: self.root_dir.try_clone()?,
         })
     }
 
@@ -206,27 +286,29 @@ impl Workspace {
     }
 
     pub fn list_tree(&self, path: Option<&VaultPath>) -> Result<Vec<TreeNode>> {
-        let absolute = match path {
-            Some(path) => path.join_to(self.vault.root.as_path()),
-            None => self.vault.root.as_path().to_path_buf(),
+        let relative = path.map(vault_path_to_std).unwrap_or_default();
+        self.reject_symlink_path(&relative, true)?;
+        let entries_result = if relative.as_os_str().is_empty() {
+            self.root_dir.entries()
+        } else {
+            self.root_dir.read_dir(&relative)
         };
-        ensure_inside_vault(self.vault.root.as_path(), &absolute)?;
-        if is_symlink(&absolute)? {
-            bail!(
-                "refusing to load symlinked tree path: {}",
-                absolute.display()
-            );
-        }
-
-        let entries = match fs::read_dir(&absolute) {
+        let entries = match entries_result {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                log::warn!("skipping unreadable directory {}", absolute.display());
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && path.is_none() => {
+                log::warn!(
+                    "skipping unreadable directory {}",
+                    self.display_path(&relative).display()
+                );
                 return Ok(Vec::new());
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("reading directory {}", absolute.display()));
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading directory {}",
+                        self.display_path(&relative).display()
+                    )
+                });
             }
         };
 
@@ -237,17 +319,25 @@ impl Workspace {
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     log::warn!(
                         "skipping unreadable directory entry in {}",
-                        absolute.display()
+                        self.display_path(&relative).display()
                     );
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
-            let entry_path = entry.path();
-            if is_ignored_path(self.vault.root.as_path(), &entry_path) {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                log::warn!(
+                    "skipping non-UTF-8 path in {}",
+                    self.display_path(&relative).display()
+                );
+                continue;
+            };
+            let entry_relative = relative.join(name_str);
+            if is_ignored_relative(&entry_relative) {
                 continue;
             }
-            let metadata = match fs::symlink_metadata(&entry_path) {
+            let metadata = match self.root_dir.symlink_metadata(&entry_relative) {
                 Ok(metadata) => metadata,
                 Err(error)
                     if matches!(
@@ -255,12 +345,21 @@ impl Workspace {
                         io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
                     ) =>
                 {
-                    log::warn!("skipping inaccessible path {}", entry_path.display());
+                    log::warn!(
+                        "skipping inaccessible path {}",
+                        self.display_path(&entry_relative).display()
+                    );
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
-            let relative = vault_relative_path(self.vault.root.as_path(), &entry_path)?;
+            let relative = match utf8_relative_path(&entry_relative) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    log::warn!("{error}");
+                    continue;
+                }
+            };
             let name = relative
                 .file_name()
                 .map(ToOwned::to_owned)
@@ -276,7 +375,7 @@ impl Workspace {
                 kind,
                 expanded: false,
                 git_status: None,
-                warning: directory_warning(&entry_path),
+                warning: self.directory_warning(&entry_relative),
             });
         }
         nodes.sort_by(compare_tree_nodes);
@@ -285,28 +384,60 @@ impl Workspace {
 
     pub fn list_files(&self) -> Result<Vec<TreeNode>> {
         let root = self.vault.root.as_path();
-        let mut nodes = Vec::new();
-        for entry in WalkDir::new(root)
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .standard_filters(true)
+            .require_git(false)
             .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !is_ignored(root, entry))
-        {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if is_permission_denied_walkdir_error(&error) => {
-                    if let Some(path) = error.path() {
-                        log::warn!("skipping unreadable path {}", path.display());
-                    } else {
-                        log::warn!("skipping unreadable path");
-                    }
+            .threads(2)
+            .overrides(default_ignore_overrides(root)?);
+
+        let (sender, receiver) = mpsc::channel();
+        builder.build_parallel().run(|| {
+            let sender = sender.clone();
+            Box::new(move |result| {
+                let _ = sender.send(result.map(|entry| entry.into_path()));
+                ignore::WalkState::Continue
+            })
+        });
+        drop(sender);
+
+        let mut nodes = Vec::new();
+        for result in receiver {
+            let entry_path = match result {
+                Ok(path) => path,
+                Err(error) if is_permission_denied_ignore_error(&error) => {
+                    log::warn!("skipping unreadable path");
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
-            if entry.path() == root || entry.file_type().is_dir() {
+            if entry_path == root || is_ignored_path(root, &entry_path) {
                 continue;
             }
-            let relative = vault_relative_path(root, entry.path())?;
+            let metadata = match fs::symlink_metadata(&entry_path) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    log::warn!("skipping inaccessible path {}", entry_path.display());
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let relative = match vault_relative_path(root, &entry_path) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    log::warn!("{error}");
+                    continue;
+                }
+            };
             let path = VaultPath::new(&relative)?;
             nodes.push(TreeNode {
                 name: relative
@@ -334,42 +465,59 @@ impl Workspace {
     }
 
     pub fn read_file(&self, path: &VaultPath) -> Result<String> {
-        let absolute = self.checked_absolute(path)?;
-        if is_symlink(&absolute)? {
-            bail!("refusing to read symlinked file: {}", path.as_str());
-        }
-        fs::read_to_string(absolute).with_context(|| format!("reading {}", path.as_str()))
+        let (contents, _) = self.open_file(path)?;
+        Ok(contents)
     }
 
     pub fn open_file(&self, path: &VaultPath) -> Result<(String, OpenFileSnapshot)> {
-        let contents = self.read_file(path)?;
-        let snapshot = self
-            .file_snapshot(path)?
-            .ok_or_else(|| anyhow!("file disappeared while opening {}", path.as_str()))?;
+        let relative = vault_path_to_std(path);
+        self.reject_symlink_path(&relative, true)?;
+        let bytes = self
+            .root_dir
+            .read(&relative)
+            .with_context(|| format!("reading {}", path.as_str()))?;
+        let metadata = self
+            .root_dir
+            .symlink_metadata(&relative)
+            .with_context(|| format!("snapshotting {}", path.as_str()))?;
+        if !metadata.is_file() {
+            bail!("not a file: {}", path.as_str());
+        }
+        let snapshot = snapshot_from_bytes(&metadata, &bytes);
+        let contents = String::from_utf8(bytes)
+            .with_context(|| format!("{} is not valid UTF-8", path.as_str()))?;
         Ok((contents, snapshot))
     }
 
     pub fn file_snapshot(&self, path: &VaultPath) -> Result<Option<OpenFileSnapshot>> {
-        let absolute = self.checked_absolute(path)?;
-        file_snapshot_at(&absolute)
+        let relative = vault_path_to_std(path);
+        if let Some(parent) = relative.parent() {
+            self.reject_existing_symlink_components(parent)?;
+        }
+        file_snapshot_at(&self.root_dir, &relative)
     }
 
     pub fn create_file(&self, path: &VaultPath, contents: &str) -> Result<()> {
-        let absolute = self.checked_absolute(path)?;
-        if absolute.exists() {
-            bail!("file already exists: {}", path.as_str());
-        }
-        atomic_write(&absolute, contents)
+        let (parent, file_name) = self.open_parent_dir(path)?;
+        let mut file = parent
+            .open_with(&file_name, OpenOptions::new().write(true).create_new(true))
+            .with_context(|| format!("creating {}", path.as_str()))?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
     }
 
     pub fn save_file(&self, path: &VaultPath, contents: &str) -> Result<()> {
-        let absolute = self.checked_absolute(path)?;
-        atomic_write(&absolute, contents)
+        self.reject_symlink(path)?;
+        let (parent, file_name) = self.open_parent_dir(path)?;
+        atomic_write(&parent, &file_name, contents)
     }
 
     pub fn create_directory(&self, path: &VaultPath) -> Result<()> {
-        let absolute = self.checked_absolute(path)?;
-        fs::create_dir_all(&absolute)
+        let relative = vault_path_to_std(path);
+        self.reject_existing_symlink_components(&relative)?;
+        self.root_dir
+            .create_dir_all(&relative)
             .with_context(|| format!("creating directory {}", path.as_str()))?;
         Ok(())
     }
@@ -383,33 +531,120 @@ impl Workspace {
     }
 
     pub fn delete_file(&self, path: &VaultPath) -> Result<()> {
-        let absolute = self.checked_absolute(path)?;
-        let metadata = fs::symlink_metadata(&absolute)
+        let relative = vault_path_to_std(path);
+        self.reject_symlink_path(&relative, true)?;
+        let metadata = self
+            .root_dir
+            .symlink_metadata(&relative)
             .with_context(|| format!("checking {}", path.as_str()))?;
         if metadata.is_dir() {
-            fs::remove_dir_all(&absolute)
+            self.root_dir
+                .remove_dir_all(&relative)
                 .with_context(|| format!("deleting directory {}", path.as_str()))?;
         } else {
-            fs::remove_file(&absolute).with_context(|| format!("deleting {}", path.as_str()))?;
+            self.root_dir
+                .remove_file(&relative)
+                .with_context(|| format!("deleting {}", path.as_str()))?;
         }
         Ok(())
     }
 
     fn rename_path(&self, from: &VaultPath, to: &VaultPath) -> Result<()> {
-        let from_absolute = self.checked_absolute(from)?;
-        let to_absolute = self.checked_absolute(to)?;
-        if let Some(parent) = to_absolute.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::rename(&from_absolute, &to_absolute)
+        let from_relative = vault_path_to_std(from);
+        self.reject_symlink_path(&from_relative, true)?;
+        self.reject_symlink(to)?;
+        let (to_parent, to_name) = self.open_parent_dir(to)?;
+        self.root_dir
+            .rename(&from_relative, &to_parent, &to_name)
             .with_context(|| format!("renaming {} to {}", from.as_str(), to.as_str()))?;
         Ok(())
     }
 
-    fn checked_absolute(&self, path: &VaultPath) -> Result<PathBuf> {
-        let absolute = path.join_to(self.vault.root.as_path());
-        ensure_inside_vault(self.vault.root.as_path(), &absolute)?;
-        Ok(absolute)
+    fn open_parent_dir(&self, path: &VaultPath) -> Result<(Dir, OsString)> {
+        let relative = vault_path_to_std(path);
+        let file_name = relative
+            .file_name()
+            .ok_or_else(|| anyhow!("path has no file name: {}", path.as_str()))?
+            .to_os_string();
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        self.reject_existing_symlink_components(parent)?;
+        if !parent.as_os_str().is_empty() {
+            self.root_dir
+                .create_dir_all(parent)
+                .with_context(|| format!("creating parent directory for {}", path.as_str()))?;
+            self.reject_existing_symlink_components(parent)?;
+        }
+        let parent_dir = if parent.as_os_str().is_empty() {
+            self.root_dir.try_clone()?
+        } else {
+            self.root_dir
+                .open_dir(parent)
+                .with_context(|| format!("opening parent directory for {}", path.as_str()))?
+        };
+        Ok((parent_dir, file_name))
+    }
+
+    fn reject_symlink(&self, path: &VaultPath) -> Result<()> {
+        self.reject_symlink_path(&vault_path_to_std(path), false)
+    }
+
+    fn reject_existing_symlink_components(&self, path: &Path) -> Result<()> {
+        self.reject_symlink_path(path, false)
+    }
+
+    fn reject_symlink_path(&self, path: &Path, require_exists: bool) -> Result<()> {
+        let mut current = PathBuf::new();
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => current.push(part),
+                Component::CurDir => continue,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    bail!("invalid vault path component in {}", path.display());
+                }
+            }
+            match self.root_dir.symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!(
+                        "refusing to access symlinked vault path: {}",
+                        path.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound && !require_exists => {
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("checking {}", path.display()))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn directory_warning(&self, path: &Path) -> Option<String> {
+        let Ok(metadata) = self.root_dir.symlink_metadata(path) else {
+            return Some("Cannot read metadata".to_owned());
+        };
+        if metadata.file_type().is_symlink() {
+            return Some("Symlink not followed".to_owned());
+        }
+        if !metadata.is_dir() {
+            return None;
+        }
+        match self.root_dir.read_dir(path) {
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                Some("Permission denied".to_owned())
+            }
+            Err(error) => Some(error.to_string()),
+        }
+    }
+
+    fn display_path(&self, relative: &Path) -> PathBuf {
+        self.vault.root.as_path().join(relative)
     }
 }
 
@@ -428,41 +663,16 @@ fn compare_tree_nodes(a: &TreeNode, b: &TreeNode) -> std::cmp::Ordering {
         .then_with(|| a.path.cmp(&b.path))
 }
 
-fn directory_warning(path: &Path) -> Option<String> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Some("Cannot read metadata".to_owned());
-    };
-    if metadata.file_type().is_symlink() {
-        return Some("Symlink not followed".to_owned());
-    }
-    if !metadata.is_dir() {
-        return None;
-    }
-    match fs::read_dir(path) {
-        Ok(_) => None,
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            Some("Permission denied".to_owned())
-        }
-        Err(error) => Some(error.to_string()),
-    }
-}
-
-fn atomic_write(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temp_path = sibling_temp_path(path);
-    {
-        let mut file = fs::File::create(&temp_path)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    fs::rename(&temp_path, path)?;
+fn atomic_write(parent: &Dir, file_name: &OsStr, contents: &str) -> Result<()> {
+    let mut temp_file = TempFile::new(parent)?;
+    temp_file.write_all(contents.as_bytes())?;
+    temp_file.as_file().sync_all()?;
+    temp_file.replace(file_name)?;
     Ok(())
 }
 
-fn file_snapshot_at(path: &Path) -> Result<Option<OpenFileSnapshot>> {
-    let metadata = match fs::symlink_metadata(path) {
+fn file_snapshot_at(root: &Dir, path: &Path) -> Result<Option<OpenFileSnapshot>> {
+    let metadata = match root.symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -473,52 +683,47 @@ fn file_snapshot_at(path: &Path) -> Result<Option<OpenFileSnapshot>> {
     if !metadata.is_file() {
         return Ok(None);
     }
-    let contents = fs::read(path)?;
+    let mut file = root.open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(Some(OpenFileSnapshot {
         modified_ms: modified_ms(&metadata),
         size_bytes: metadata.len(),
-        content_hash: blake3::hash(&contents),
+        content_hash: hasher.finalize(),
     }))
 }
 
-fn modified_ms(metadata: &fs::Metadata) -> u64 {
+fn snapshot_from_bytes(metadata: &Metadata, contents: &[u8]) -> OpenFileSnapshot {
+    OpenFileSnapshot {
+        modified_ms: modified_ms(metadata),
+        size_bytes: metadata.len(),
+        content_hash: blake3::hash(contents),
+    }
+}
+
+fn modified_ms(metadata: &Metadata) -> u64 {
     metadata
         .modified()
         .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|modified| {
+            modified
+                .into_std()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+        })
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or_default()
 }
 
-fn sibling_temp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("lattice");
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    path.with_file_name(format!(".{file_name}.{nonce}.tmp"))
-}
-
-fn ensure_inside_vault(root: &Path, path: &Path) -> Result<()> {
-    if !path.starts_with(root) {
-        bail!("path escapes vault: {}", path.display());
-    }
-    Ok(())
-}
-
-fn is_symlink(path: &Path) -> Result<bool> {
-    Ok(fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Ok(false)
-            } else {
-                Err(error)
-            }
-        })?)
+fn vault_path_to_std(path: &VaultPath) -> PathBuf {
+    path.as_path().as_std_path().to_path_buf()
 }
 
 fn vault_relative_path(root: &Path, path: &Path) -> Result<Utf8PathBuf> {
@@ -527,20 +732,34 @@ fn vault_relative_path(root: &Path, path: &Path) -> Result<Utf8PathBuf> {
         .map_err(|path| anyhow!("non-UTF-8 vault path: {}", path.display()))
 }
 
-fn is_ignored(root: &Path, entry: &DirEntry) -> bool {
-    is_ignored_path(root, entry.path())
+fn utf8_relative_path(path: &Path) -> Result<Utf8PathBuf> {
+    Utf8PathBuf::from_path_buf(path.to_path_buf())
+        .map_err(|path| anyhow!("non-UTF-8 vault path: {}", path.display()))
 }
 
-fn is_permission_denied_walkdir_error(error: &walkdir::Error) -> bool {
+fn is_permission_denied_ignore_error(error: &ignore::Error) -> bool {
     error
         .io_error()
         .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+}
+
+fn default_ignore_overrides(root: &Path) -> Result<ignore::overrides::Override> {
+    let mut overrides = OverrideBuilder::new(root);
+    for ignored in DEFAULT_IGNORES {
+        overrides.add(&format!("!{ignored}"))?;
+        overrides.add(&format!("!{ignored}/**"))?;
+    }
+    Ok(overrides.build()?)
 }
 
 pub fn is_ignored_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
+    is_ignored_relative(relative)
+}
+
+fn is_ignored_relative(relative: &Path) -> bool {
     let normalized = relative.to_string_lossy().replace('\\', "/");
     DEFAULT_IGNORES
         .iter()
@@ -561,22 +780,22 @@ fn log_notify_error(error: notify::Error) {
     log::warn!("workspace watcher error: {error}");
 }
 
-pub fn kind_for_path(path: &VaultPath) -> FileKind {
-    FileKind::from_path(path.as_path())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_vault() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "lattice-workspace-test-{}-{nonce}",
+            "lattice-workspace-test-{}-{nonce}-{counter}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
@@ -682,6 +901,45 @@ mod tests {
     }
 
     #[test]
+    fn quick_open_mutates_index_and_limits_search_results() {
+        let alpha = VaultPath::try_from("alpha.md").unwrap();
+        let beta = VaultPath::try_from("beta.md").unwrap();
+        let renamed = VaultPath::try_from("renamed-beta.md").unwrap();
+        let mut index = QuickOpenIndex::rebuild(vec![alpha.clone(), beta.clone(), alpha.clone()]);
+
+        assert_eq!(index.len(), 2);
+        index.rename(&beta, renamed.clone());
+        index.remove(&alpha);
+        index.insert(VaultPath::try_from("gamma.md").unwrap());
+
+        let matches = index.search("md", 1);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].path == renamed || matches[0].path.as_str() == "gamma.md");
+    }
+
+    #[test]
+    fn list_files_honors_gitignore_hidden_default_ignores_and_symlinks() {
+        let root = temp_vault();
+        fs::write(root.join(".gitignore"), "ignored.md\nignored-dir/\n").unwrap();
+        fs::write(root.join("note.md"), "visible").unwrap();
+        fs::write(root.join("ignored.md"), "ignored").unwrap();
+        fs::write(root.join(".hidden.md"), "hidden").unwrap();
+        fs::create_dir_all(root.join("ignored-dir")).unwrap();
+        fs::write(root.join("ignored-dir/note.md"), "ignored").unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/output.md"), "ignored").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("note.md"), root.join("link.md")).unwrap();
+
+        let workspace = Workspace::open_vault(root.clone()).unwrap();
+        let files = workspace.list_files().unwrap();
+        let paths: Vec<_> = files.iter().map(|file| file.path.as_str()).collect();
+
+        assert_eq!(paths, vec!["note.md"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn create_vault_creates_missing_folder() {
         let root = temp_vault();
         let nested = root.join("new-vault");
@@ -717,6 +975,57 @@ mod tests {
         let mut permissions = fs::metadata(&locked).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&locked, permissions).unwrap();
+
+        assert_eq!(paths, vec!["note.md"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_paths_are_rejected_for_file_operations() {
+        let root = temp_vault();
+        let outside = temp_vault();
+        fs::write(outside.join("secret.md"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.md"), root.join("file-link.md")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing.md"), root.join("dangling.md")).unwrap();
+
+        let workspace = Workspace::open_vault(root.clone()).unwrap();
+        let linked_child = VaultPath::try_from("linked/secret.md").unwrap();
+        let file_link = VaultPath::try_from("file-link.md").unwrap();
+        let dangling = VaultPath::try_from("dangling.md").unwrap();
+        let normal = VaultPath::try_from("normal.md").unwrap();
+        let target = VaultPath::try_from("renamed.md").unwrap();
+
+        assert!(workspace.open_file(&linked_child).is_err());
+        assert!(workspace.save_file(&linked_child, "x").is_err());
+        assert!(workspace.delete_file(&file_link).is_err());
+        assert!(workspace.create_file(&dangling, "x").is_err());
+        workspace.create_file(&normal, "ok").unwrap();
+        assert!(workspace.rename_file(&normal, &file_link).is_err());
+        workspace.rename_file(&normal, &target).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_names_are_skipped() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_vault();
+        fs::write(root.join("note.md"), "visible").unwrap();
+        fs::write(
+            root.join(OsString::from_vec(b"bad-\xFF.md".to_vec())),
+            "bad",
+        )
+        .unwrap();
+
+        let workspace = Workspace::open_vault(root.clone()).unwrap();
+        let files = workspace.list_files().unwrap();
+        let paths: Vec<_> = files.iter().map(|file| file.path.as_str()).collect();
 
         assert_eq!(paths, vec!["note.md"]);
         fs::remove_dir_all(root).unwrap();
