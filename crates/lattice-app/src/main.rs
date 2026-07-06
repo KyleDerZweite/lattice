@@ -1,20 +1,26 @@
 use clap::Parser;
 use eframe::egui;
 use lattice_core::{AppSettings, OpenFileSnapshot, ThemeMode, VaultPath};
-use lattice_ui::Theme;
 use lattice_editor::EditorBuffer;
+use lattice_ui::Theme;
 use lattice_workspace::{
-    QuickOpenIndex, TreeNode, TreeNodeKind, Workspace, WorkspaceEventKind, WorkspaceWatcher,
+    find_text_matches, replace_all_text, replace_text_match, search_path_matches, QuickOpenIndex,
+    SearchMatch, SearchQuery, TextMatch, TreeNode, TreeNodeKind, Workspace, WorkspaceEventKind,
+    WorkspaceReplaceReport, WorkspaceSearchOptions, WorkspaceSearchResult, WorkspaceWatcher,
 };
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const WATCHER_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+const WORKSPACE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
+const WORKSPACE_SEARCH_RESULT_LIMIT: usize = 10_000;
 const LARGE_FILE_WARNING_BYTES: u64 = 10 * 1024 * 1024;
 /// Above this size the syntect pass is skipped: highlighting re-tokenizes the whole
 /// buffer whenever the memoized cache misses, which is too slow for huge files.
@@ -201,6 +207,28 @@ fn run_benchmark(path: Option<PathBuf>, queries: Vec<String>) -> Result<(), Stri
             search_start.elapsed().as_secs_f64() * 1000.0,
             matches.len()
         );
+
+        let content_start = Instant::now();
+        let content = workspace
+            .search_workspace(
+                &WorkspaceSearchOptions {
+                    query: SearchQuery {
+                        text: query.clone(),
+                        ..Default::default()
+                    },
+                    max_results: WORKSPACE_SEARCH_RESULT_LIMIT,
+                    ..Default::default()
+                },
+                || false,
+            )
+            .map_err(|error| error.to_string())?;
+        println!(
+            "content_search_ms query={:?} ms={:.3} matches={} files_scanned={}",
+            query,
+            content_start.elapsed().as_secs_f64() * 1000.0,
+            content.matches.len(),
+            content.files_scanned
+        );
     }
 
     println!(
@@ -217,6 +245,79 @@ fn run_benchmark(path: Option<PathBuf>, queries: Vec<String>) -> Result<(), Stri
 enum Pane {
     Sidebar,
     Editor,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SidebarView {
+    #[default]
+    Files,
+    Search,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceSearchUi {
+    query: String,
+    replacement: String,
+    include_globs: String,
+    exclude_globs: String,
+    case_sensitive: bool,
+    whole_word: bool,
+    use_regex: bool,
+    show_replace: bool,
+    show_filters: bool,
+    focus_pending: bool,
+    search_due_at: Option<Instant>,
+    active_job: Option<WorkspaceJobId>,
+    pending: bool,
+    result: Option<WorkspaceSearchResult>,
+    error: Option<String>,
+    expanded_files: BTreeSet<VaultPath>,
+    replace_confirmation: bool,
+    replace_pending: bool,
+    local_replace_count: usize,
+    local_replace_files: usize,
+}
+
+impl WorkspaceSearchUi {
+    fn options(&self) -> WorkspaceSearchOptions {
+        WorkspaceSearchOptions {
+            query: SearchQuery {
+                text: self.query.clone(),
+                case_sensitive: self.case_sensitive,
+                whole_word: self.whole_word,
+                use_regex: self.use_regex,
+            },
+            include_globs: parse_globs(&self.include_globs),
+            exclude_globs: parse_globs(&self.exclude_globs),
+            max_results: WORKSPACE_SEARCH_RESULT_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct EditorFindUi {
+    visible: bool,
+    show_replace: bool,
+    focus_pending: bool,
+    query: String,
+    replacement: String,
+    case_sensitive: bool,
+    whole_word: bool,
+    use_regex: bool,
+    matches: Vec<TextMatch>,
+    current: Option<usize>,
+    error: Option<String>,
+}
+
+impl EditorFindUi {
+    fn query(&self) -> SearchQuery {
+        SearchQuery {
+            text: self.query.clone(),
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            use_regex: self.use_regex,
+        }
+    }
 }
 
 struct LatticeApp {
@@ -239,6 +340,10 @@ struct LatticeApp {
     quick_open_overlay: bool,
     quick_query: String,
     show_sidebar: bool,
+    sidebar_view: SidebarView,
+    workspace_search: WorkspaceSearchUi,
+    editor_find: EditorFindUi,
+    pending_search_navigation: Option<(VaultPath, usize, usize)>,
     tile_tree: egui_tiles::Tree<Pane>,
     sidebar_tile: egui_tiles::TileId,
     selected_path: Option<VaultPath>,
@@ -267,10 +372,14 @@ struct EditorTab {
     buffer: EditorBuffer,
     last_edit: Option<Instant>,
     conflict: Option<FileConflict>,
+    /// True while a `SaveFile` command is in flight for this tab, so autosave
+    /// does not re-enqueue the same save every frame until the response lands.
+    save_in_flight: bool,
     large_file_warning: bool,
     /// Cached line-number gutter text, rebuilt only when the line count changes.
     gutter: String,
     gutter_lines: usize,
+    pending_selection: Option<(usize, usize)>,
 }
 
 impl EditorTab {
@@ -312,6 +421,7 @@ struct WorkspaceJobId(u64);
 struct WorkspaceWorker {
     sender: Sender<WorkspaceCommand>,
     receiver: Receiver<WorkspaceResponse>,
+    search_revision: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -324,6 +434,20 @@ enum WorkspaceCommand {
     BuildQuickOpen {
         job_id: WorkspaceJobId,
         generation: WorkspaceGeneration,
+    },
+    SearchWorkspace {
+        job_id: WorkspaceJobId,
+        generation: WorkspaceGeneration,
+        options: WorkspaceSearchOptions,
+        open_files: Vec<(VaultPath, String)>,
+    },
+    ReplaceWorkspace {
+        job_id: WorkspaceJobId,
+        generation: WorkspaceGeneration,
+        options: WorkspaceSearchOptions,
+        replacement: String,
+        include_paths: Option<BTreeSet<VaultPath>>,
+        excluded_paths: BTreeSet<VaultPath>,
     },
     OpenFile {
         job_id: WorkspaceJobId,
@@ -374,6 +498,16 @@ enum WorkspaceResponse {
         job_id: WorkspaceJobId,
         generation: WorkspaceGeneration,
         result: Result<QuickOpenIndex, String>,
+    },
+    WorkspaceSearched {
+        job_id: WorkspaceJobId,
+        generation: WorkspaceGeneration,
+        result: Result<WorkspaceSearchResult, String>,
+    },
+    WorkspaceReplaced {
+        job_id: WorkspaceJobId,
+        generation: WorkspaceGeneration,
+        result: Result<WorkspaceReplaceReport, String>,
     },
     FileOpened {
         job_id: WorkspaceJobId,
@@ -460,11 +594,89 @@ impl WorkspaceWorker {
     fn start(workspace: Workspace, ctx: egui::Context) -> Self {
         let (command_sender, command_receiver) = mpsc::channel();
         let (response_sender, response_receiver) = mpsc::channel();
+        let search_revision = Arc::new(AtomicU64::new(0));
+        let worker_search_revision = Arc::clone(&search_revision);
         thread::spawn(move || {
             while let Ok(command) = command_receiver.recv() {
                 if matches!(command, WorkspaceCommand::Shutdown) {
                     break;
                 }
+                let command = match command {
+                    WorkspaceCommand::SearchWorkspace {
+                        job_id,
+                        generation,
+                        options,
+                        open_files,
+                    } => {
+                        let Ok(search_workspace) = workspace.try_clone_for_worker() else {
+                            let _ = response_sender.send(WorkspaceResponse::WorkspaceSearched {
+                                job_id,
+                                generation,
+                                result: Err("failed to clone workspace for search".to_owned()),
+                            });
+                            ctx.request_repaint();
+                            continue;
+                        };
+                        let response_sender = response_sender.clone();
+                        let ctx = ctx.clone();
+                        let revision = Arc::clone(&worker_search_revision);
+                        thread::spawn(move || {
+                            let result = search_workspace
+                                .search_workspace_with_open_files(&options, &open_files, || {
+                                    revision.load(Ordering::Relaxed) != job_id.0
+                                })
+                                .map_err(|error| error.to_string());
+                            let _ = response_sender.send(WorkspaceResponse::WorkspaceSearched {
+                                job_id,
+                                generation,
+                                result,
+                            });
+                            ctx.request_repaint();
+                        });
+                        continue;
+                    }
+                    WorkspaceCommand::ReplaceWorkspace {
+                        job_id,
+                        generation,
+                        options,
+                        replacement,
+                        include_paths,
+                        excluded_paths,
+                    } => {
+                        // Like search, replace fans out over the whole workspace and
+                        // can run for a while; keep the worker free for saves/opens.
+                        let Ok(replace_workspace) = workspace.try_clone_for_worker() else {
+                            let _ = response_sender.send(WorkspaceResponse::WorkspaceReplaced {
+                                job_id,
+                                generation,
+                                result: Err("failed to clone workspace for replace".to_owned()),
+                            });
+                            ctx.request_repaint();
+                            continue;
+                        };
+                        let response_sender = response_sender.clone();
+                        let ctx = ctx.clone();
+                        thread::spawn(move || {
+                            let result = replace_workspace
+                                .replace_workspace(
+                                    &options,
+                                    &replacement,
+                                    include_paths.as_ref(),
+                                    &excluded_paths,
+                                    || false,
+                                )
+                                .map_err(|error| error.to_string());
+                            let _ = response_sender.send(WorkspaceResponse::WorkspaceReplaced {
+                                job_id,
+                                generation,
+                                result,
+                            });
+                            ctx.request_repaint();
+                        });
+                        continue;
+                    }
+                    command => command,
+                };
                 if let Some(response) = run_workspace_command(&workspace, command) {
                     let _ = response_sender.send(response);
                     ctx.request_repaint();
@@ -474,15 +686,29 @@ impl WorkspaceWorker {
         Self {
             sender: command_sender,
             receiver: response_receiver,
+            search_revision,
         }
     }
 
     fn send(&self, command: WorkspaceCommand) {
+        match &command {
+            WorkspaceCommand::SearchWorkspace { job_id, .. } => {
+                self.search_revision.store(job_id.0, Ordering::Relaxed);
+            }
+            WorkspaceCommand::ReplaceWorkspace { .. } => {
+                self.search_revision.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         let _ = self.sender.send(command);
     }
 
     fn try_recv(&self) -> Option<WorkspaceResponse> {
         self.receiver.try_recv().ok()
+    }
+
+    fn cancel_search(&self) {
+        self.search_revision.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -592,7 +818,9 @@ fn run_workspace_command(
                 .map_err(|error| error.to_string()),
             path,
         },
-        WorkspaceCommand::Shutdown => return None,
+        WorkspaceCommand::SearchWorkspace { .. }
+        | WorkspaceCommand::ReplaceWorkspace { .. }
+        | WorkspaceCommand::Shutdown => return None,
     })
 }
 
@@ -706,6 +934,10 @@ impl LatticeApp {
             quick_open_overlay: false,
             quick_query: String::new(),
             show_sidebar: true,
+            sidebar_view: SidebarView::Files,
+            workspace_search: WorkspaceSearchUi::default(),
+            editor_find: EditorFindUi::default(),
+            pending_search_navigation: None,
             tile_tree,
             sidebar_tile,
             selected_path: None,
@@ -757,6 +989,132 @@ impl LatticeApp {
         self.send_workspace_command(WorkspaceCommand::BuildQuickOpen { job_id, generation });
     }
 
+    fn open_workspace_search(&mut self, show_replace: bool) {
+        self.sidebar_view = SidebarView::Search;
+        self.show_sidebar = true;
+        self.workspace_search.show_replace |= show_replace;
+        self.workspace_search.focus_pending = true;
+        if !self.workspace_search.query.trim().is_empty() {
+            self.schedule_workspace_search();
+        }
+    }
+
+    fn schedule_workspace_search(&mut self) {
+        self.workspace_search.replace_confirmation = false;
+        if self.workspace_search.query.trim().is_empty() {
+            if let Some(worker) = &self.worker {
+                worker.cancel_search();
+            }
+            self.workspace_search.active_job = None;
+            self.workspace_search.pending = false;
+            self.workspace_search.result = None;
+            self.workspace_search.error = None;
+            self.workspace_search.search_due_at = None;
+            return;
+        }
+        self.workspace_search.search_due_at = Some(Instant::now() + WORKSPACE_SEARCH_DEBOUNCE);
+        self.egui_ctx
+            .request_repaint_after(WORKSPACE_SEARCH_DEBOUNCE);
+    }
+
+    fn process_pending_workspace_search(&mut self) {
+        let Some(due_at) = self.workspace_search.search_due_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < due_at {
+            self.egui_ctx.request_repaint_after(due_at - now);
+            return;
+        }
+        self.workspace_search.search_due_at = None;
+        let options = self.workspace_search.options();
+        let generation = self.workspace_generation;
+        let job_id = self.next_workspace_job_id();
+        self.workspace_search.active_job = Some(job_id);
+        self.workspace_search.pending = true;
+        self.workspace_search.error = None;
+        self.send_workspace_command(WorkspaceCommand::SearchWorkspace {
+            job_id,
+            generation,
+            options,
+            open_files: self
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    tab.path()
+                        .cloned()
+                        .map(|path| (path, tab.buffer.text.clone()))
+                })
+                .collect(),
+        });
+    }
+
+    fn replace_workspace_matches(&mut self, include_paths: Option<BTreeSet<VaultPath>>) {
+        if self.workspace_search.replace_pending || self.workspace_search.query.is_empty() {
+            return;
+        }
+        let options = self.workspace_search.options();
+        if let Err(error) = find_text_matches("", &options.query, 1) {
+            self.workspace_search.error = Some(error.to_string());
+            return;
+        }
+
+        let replacement = self.workspace_search.replacement.clone();
+        let mut changed_tabs = Vec::new();
+        let mut local_replace_count = 0;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let Some(path) = tab.path() else {
+                continue;
+            };
+            let explicitly_included = include_paths
+                .as_ref()
+                .is_none_or(|paths| paths.contains(path));
+            let matches_filters = search_path_matches(path, &options).unwrap_or(false);
+            if !explicitly_included || !matches_filters {
+                continue;
+            }
+            match replace_all_text(&tab.buffer.text, &options.query, &replacement) {
+                Ok((updated, count)) if count > 0 => {
+                    tab.buffer.text = updated;
+                    tab.buffer.dirty = true;
+                    tab.last_edit = Some(Instant::now());
+                    local_replace_count += count;
+                    changed_tabs.push(index);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.workspace_search.error = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+
+        let excluded_paths = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.path().cloned())
+            .collect();
+        let generation = self.workspace_generation;
+        let job_id = self.next_workspace_job_id();
+        self.workspace_search.replace_pending = true;
+        self.workspace_search.replace_confirmation = false;
+        self.workspace_search.local_replace_count = local_replace_count;
+        self.workspace_search.local_replace_files = changed_tabs.len();
+        self.status = "Replacing matches...".to_owned();
+        self.send_workspace_command(WorkspaceCommand::ReplaceWorkspace {
+            job_id,
+            generation,
+            options,
+            replacement,
+            include_paths,
+            excluded_paths,
+        });
+        for index in changed_tabs {
+            self.save_tab(index);
+        }
+        self.refresh_editor_find_matches();
+    }
+
     fn drain_worker_responses(&mut self) {
         let mut drained = 0;
         while drained < MAX_WORKER_RESPONSES_PER_FRAME {
@@ -775,6 +1133,12 @@ impl LatticeApp {
                 job_id, generation, ..
             }
             | WorkspaceResponse::QuickOpenBuilt {
+                job_id, generation, ..
+            }
+            | WorkspaceResponse::WorkspaceSearched {
+                job_id, generation, ..
+            }
+            | WorkspaceResponse::WorkspaceReplaced {
                 job_id, generation, ..
             }
             | WorkspaceResponse::FileOpened {
@@ -823,6 +1187,70 @@ impl LatticeApp {
                     Err(error) => {
                         self.open_error = Some(error);
                         self.status = "Quick open index failed".to_owned();
+                    }
+                }
+            }
+            WorkspaceResponse::WorkspaceSearched {
+                job_id,
+                result,
+                generation: _,
+            } => {
+                if self.workspace_search.active_job != Some(job_id) {
+                    return;
+                }
+                self.workspace_search.pending = false;
+                match result {
+                    Ok(result) => {
+                        self.status = format!(
+                            "Found {} results in {} files",
+                            result.matches.len(),
+                            result.files_with_matches
+                        );
+                        self.workspace_search.expanded_files = result
+                            .matches
+                            .iter()
+                            .map(|matched| matched.path.clone())
+                            .collect();
+                        self.workspace_search.result = Some(result);
+                        self.workspace_search.error = None;
+                    }
+                    Err(error) => {
+                        self.workspace_search.result = None;
+                        self.workspace_search.error = Some(error);
+                        self.status = "Workspace search failed".to_owned();
+                    }
+                }
+            }
+            WorkspaceResponse::WorkspaceReplaced {
+                result,
+                job_id: _,
+                generation: _,
+            } => {
+                self.workspace_search.replace_pending = false;
+                match result {
+                    Ok(report) => {
+                        let replacements =
+                            report.replacements + self.workspace_search.local_replace_count;
+                        let files = report.files_changed + self.workspace_search.local_replace_files;
+                        self.workspace_search.local_replace_count = 0;
+                        self.workspace_search.local_replace_files = 0;
+                        if report.errors.is_empty() {
+                            self.status = format!("Replaced {replacements} matches in {files} files");
+                            self.open_error = None;
+                        } else {
+                            self.status = format!(
+                                "Replaced {replacements} matches with {} errors",
+                                report.errors.len()
+                            );
+                            self.open_error = Some(report.errors.join("\n"));
+                        }
+                        self.refresh_workspace_data();
+                    }
+                    Err(error) => {
+                        self.workspace_search.local_replace_count = 0;
+                        self.workspace_search.local_replace_files = 0;
+                        self.workspace_search.error = Some(error);
+                        self.status = "Replace in files failed".to_owned();
                     }
                 }
             }
@@ -961,7 +1389,9 @@ impl LatticeApp {
                             });
                     }
                     self.active_tab = Some(index);
-                    self.selected_path = Some(path);
+                    self.selected_path = Some(path.clone());
+                    self.refresh_editor_find_matches();
+                    self.apply_pending_search_navigation(&path, index);
                     self.status = "Reloaded file".to_owned();
                     return;
                 }
@@ -970,14 +1400,19 @@ impl LatticeApp {
                     buffer: EditorBuffer::from_disk(path.clone(), contents, snapshot),
                     last_edit: None,
                     conflict: None,
+                    save_in_flight: false,
                     large_file_warning,
                     gutter: String::new(),
                     gutter_lines: 0,
+                    pending_selection: None,
                 };
                 self.tabs.push(tab);
                 self.active_tab = Some(self.tabs.len() - 1);
+                let index = self.tabs.len() - 1;
                 self.selected_path = Some(path.clone());
                 self.rename_target = path.as_str().to_owned();
+                self.refresh_editor_find_matches();
+                self.apply_pending_search_navigation(&path, index);
                 self.status = format!("Opened {}", path.as_str());
                 self.open_error = None;
             }
@@ -1001,12 +1436,24 @@ impl LatticeApp {
         else {
             return;
         };
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.save_in_flight = false;
+        }
         match result {
             Ok(SaveWorkerResult::Saved(snapshot)) => {
                 if let Some(tab) = self.tabs.get_mut(index) {
-                    tab.buffer.mark_saved(snapshot);
+                    // The buffer may have been edited while the save was in
+                    // flight; the snapshot is the new disk state either way, but
+                    // only clear dirty when the buffer still matches it so those
+                    // newer edits stay scheduled for the next autosave.
+                    let buffer_matches_disk =
+                        tab.buffer.content_hash() == snapshot.content_hash;
+                    tab.buffer.base_snapshot = Some(snapshot);
+                    if buffer_matches_disk {
+                        tab.buffer.dirty = false;
+                        tab.last_edit = None;
+                    }
                     tab.conflict = None;
-                    tab.last_edit = None;
                 }
                 self.status = if overwrite {
                     format!("Overwrote {}", path.as_str())
@@ -1054,8 +1501,17 @@ impl LatticeApp {
                 } => {
                     if let Some(tab) = self.tabs.get_mut(index) {
                         if tab.path().is_some_and(|tab_path| tab_path == &path) {
-                            tab.buffer.mark_saved(snapshot);
-                            tab.conflict = None;
+                            // The check ran against a buffer hash captured when it
+                            // was enqueued; the user may have typed since. Adopt
+                            // the disk snapshot as the save base, but keep dirty
+                            // set unless the current buffer really matches disk.
+                            let buffer_matches_disk =
+                                tab.buffer.content_hash() == snapshot.content_hash;
+                            tab.buffer.base_snapshot = Some(snapshot);
+                            if buffer_matches_disk {
+                                tab.buffer.dirty = false;
+                                tab.conflict = None;
+                            }
                         }
                     }
                 }
@@ -1107,6 +1563,7 @@ impl LatticeApp {
             self.tabs.remove(index);
             self.active_tab = adjusted_active_tab(self.active_tab, index, self.tabs.len());
         }
+        self.refresh_editor_find_matches();
     }
 
     fn sorted_expanded_paths(&self) -> Vec<VaultPath> {
@@ -1183,6 +1640,10 @@ impl LatticeApp {
         self.quick_open_ready = false;
         self.quick_open_pending = false;
         self.quick_query.clear();
+        self.sidebar_view = SidebarView::Files;
+        self.workspace_search = WorkspaceSearchUi::default();
+        self.editor_find = EditorFindUi::default();
+        self.pending_search_navigation = None;
         self.open_error = None;
         self.refresh_tree_root();
     }
@@ -1205,6 +1666,11 @@ impl LatticeApp {
         self.quick_open_ready = false;
         self.quick_open_pending = false;
         self.quick_open = QuickOpenIndex::default();
+        if self.sidebar_view == SidebarView::Search
+            && !self.workspace_search.query.trim().is_empty()
+        {
+            self.schedule_workspace_search();
+        }
     }
 
     fn drain_watcher(&mut self) {
@@ -1221,32 +1687,18 @@ impl LatticeApp {
         if let Some(workspace) = &self.workspace {
             let root = workspace.vault().root.as_path();
             for event in &events {
+                // No filesystem calls here — this runs on the UI thread every
+                // frame. Create/Rename can change the file set (and only a real
+                // walk applies .gitignore correctly), so just mark the quick-open
+                // index stale; it is rebuilt lazily on the worker thread. Remove
+                // is a pure string operation, so patch the index in place.
                 match event.kind {
-                    WorkspaceEventKind::Create => {
+                    WorkspaceEventKind::Create | WorkspaceEventKind::Rename => {
                         tree_changed = true;
-                        for path in &event.paths {
-                            if fs::symlink_metadata(path)
-                                .map(|metadata| metadata.is_file())
-                                .unwrap_or(false)
-                            {
-                                if let Some(vault_path) = vault_path_from_absolute(root, path) {
-                                    self.quick_open.insert(vault_path);
-                                }
-                            }
-                        }
+                        self.quick_open_ready = false;
                     }
                     WorkspaceEventKind::Modify => {
                         file_changed = true;
-                        for path in &event.paths {
-                            if fs::symlink_metadata(path)
-                                .map(|metadata| metadata.is_file())
-                                .unwrap_or(false)
-                            {
-                                if let Some(vault_path) = vault_path_from_absolute(root, path) {
-                                    self.quick_open.insert(vault_path);
-                                }
-                            }
-                        }
                     }
                     WorkspaceEventKind::Remove => {
                         tree_changed = true;
@@ -1254,19 +1706,6 @@ impl LatticeApp {
                             if let Some(vault_path) = vault_path_from_absolute(root, path) {
                                 self.quick_open.remove(&vault_path);
                             }
-                        }
-                    }
-                    WorkspaceEventKind::Rename => {
-                        tree_changed = true;
-                        if event.paths.len() >= 2 {
-                            if let (Some(from), Some(to)) = (
-                                vault_path_from_absolute(root, &event.paths[0]),
-                                vault_path_from_absolute(root, &event.paths[event.paths.len() - 1]),
-                            ) {
-                                self.quick_open.rename(&from, to);
-                            }
-                        } else {
-                            self.quick_open_ready = false;
                         }
                     }
                     WorkspaceEventKind::Other => {}
@@ -1387,6 +1826,7 @@ impl LatticeApp {
         {
             self.active_tab = Some(index);
             self.selected_path = Some(path);
+            self.refresh_editor_find_matches();
             return;
         }
 
@@ -1400,6 +1840,214 @@ impl LatticeApp {
         });
     }
 
+    fn open_search_match(&mut self, matched: SearchMatch) {
+        let path = matched.path.clone();
+        self.pending_search_navigation = Some((path.clone(), matched.byte_start, matched.byte_end));
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.path().is_some_and(|tab_path| tab_path == &path))
+        {
+            self.active_tab = Some(index);
+            self.selected_path = Some(path.clone());
+            self.refresh_editor_find_matches();
+            self.apply_pending_search_navigation(&path, index);
+        } else {
+            self.open_editor_file(path);
+        }
+    }
+
+    fn apply_pending_search_navigation(&mut self, path: &VaultPath, index: usize) {
+        let Some((pending_path, start, end)) = self.pending_search_navigation.clone() else {
+            return;
+        };
+        if &pending_path != path {
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(index) {
+            let len = tab.buffer.text.len();
+            tab.pending_selection = Some((start.min(len), end.min(len)));
+        }
+        self.pending_search_navigation = None;
+    }
+
+    fn editor_text_id(&self, index: usize) -> egui::Id {
+        let key = self
+            .tabs
+            .get(index)
+            .and_then(EditorTab::path)
+            .map(|path| path.as_str())
+            .unwrap_or("__untitled");
+        egui::Id::new(("editor_text", key))
+    }
+
+    fn open_editor_find(&mut self, show_replace: bool) {
+        let was_visible = self.editor_find.visible;
+        self.editor_find.visible = true;
+        self.editor_find.show_replace |= show_replace;
+        self.editor_find.focus_pending = true;
+        if !was_visible {
+            if let Some(index) = self.active_tab {
+                let id = self.editor_text_id(index);
+                if let (Some(tab), Some(state)) = (
+                    self.tabs.get(index),
+                    egui::text_edit::TextEditState::load(&self.egui_ctx, id),
+                ) {
+                    if let Some(range) = state.cursor.char_range() {
+                        let range = range.as_sorted_char_range();
+                        if range.start != range.end {
+                            if let Some(selected) = char_slice(&tab.buffer.text, range) {
+                                if !selected.contains('\n') {
+                                    self.editor_find.query = selected.to_owned();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.refresh_editor_find_matches();
+    }
+
+    fn refresh_editor_find_matches(&mut self) {
+        let previous_start = self
+            .editor_find
+            .current
+            .and_then(|index| self.editor_find.matches.get(index))
+            .map(|matched| matched.byte_start);
+        self.editor_find.matches.clear();
+        self.editor_find.current = None;
+        self.editor_find.error = None;
+        if !self.editor_find.visible || self.editor_find.query.is_empty() {
+            return;
+        }
+        let Some(text) = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.buffer.text.as_str())
+        else {
+            return;
+        };
+        match find_text_matches(text, &self.editor_find.query(), usize::MAX) {
+            Ok(matches) => {
+                self.editor_find.matches = matches;
+                if !self.editor_find.matches.is_empty() {
+                    self.editor_find.current = Some(
+                        previous_start
+                            .and_then(|start| {
+                                self.editor_find
+                                    .matches
+                                    .iter()
+                                    .position(|matched| matched.byte_start >= start)
+                            })
+                            .unwrap_or(0),
+                    );
+                    if let (Some(tab_index), Some(match_index)) =
+                        (self.active_tab, self.editor_find.current)
+                    {
+                        let matched = self.editor_find.matches[match_index].clone();
+                        if let Some(tab) = self.tabs.get_mut(tab_index) {
+                            tab.pending_selection = Some((matched.byte_start, matched.byte_end));
+                        }
+                    }
+                }
+            }
+            Err(error) => self.editor_find.error = Some(error.to_string()),
+        }
+    }
+
+    fn navigate_editor_find(&mut self, delta: isize) {
+        if self.editor_find.matches.is_empty() {
+            return;
+        }
+        let len = self.editor_find.matches.len() as isize;
+        let current = self.editor_find.current.unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(len) as usize;
+        self.editor_find.current = Some(next);
+        let matched = self.editor_find.matches[next].clone();
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            tab.pending_selection = Some((matched.byte_start, matched.byte_end));
+        }
+    }
+
+    fn select_editor_find_at_or_after(&mut self, byte_offset: usize) {
+        if self.editor_find.matches.is_empty() {
+            self.editor_find.current = None;
+            return;
+        }
+        let index = self
+            .editor_find
+            .matches
+            .iter()
+            .position(|matched| matched.byte_start >= byte_offset)
+            .unwrap_or(0);
+        self.editor_find.current = Some(index);
+        let matched = self.editor_find.matches[index].clone();
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            tab.pending_selection = Some((matched.byte_start, matched.byte_end));
+        }
+    }
+
+    fn replace_current_editor_match(&mut self) {
+        let Some(match_index) = self.editor_find.current else {
+            return;
+        };
+        let Some(matched) = self.editor_find.matches.get(match_index).cloned() else {
+            return;
+        };
+        let query = self.editor_find.query();
+        let replacement = self.editor_find.replacement.clone();
+        let Some(tab_index) = self.active_tab else {
+            return;
+        };
+        let result = self
+            .tabs
+            .get(tab_index)
+            .map(|tab| replace_text_match(&tab.buffer.text, &query, &matched, &replacement));
+        match result {
+            Some(Ok(Some(updated))) => {
+                let old_len = self.tabs[tab_index].buffer.text.len();
+                let removed_len = matched.byte_end.saturating_sub(matched.byte_start);
+                let inserted_len = updated.len().saturating_sub(old_len - removed_len);
+                let selection_end = matched.byte_start + inserted_len;
+                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                    tab.buffer.text = updated;
+                    tab.buffer.dirty = true;
+                    tab.last_edit = Some(Instant::now());
+                    tab.pending_selection = Some((matched.byte_start, selection_end));
+                }
+                self.refresh_editor_find_matches();
+                self.select_editor_find_at_or_after(selection_end);
+            }
+            Some(Err(error)) => self.editor_find.error = Some(error.to_string()),
+            _ => self.refresh_editor_find_matches(),
+        }
+    }
+
+    fn replace_all_editor_matches(&mut self) {
+        let query = self.editor_find.query();
+        let replacement = self.editor_find.replacement.clone();
+        let Some(tab_index) = self.active_tab else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        match replace_all_text(&tab.buffer.text, &query, &replacement) {
+            Ok((updated, count)) if count > 0 => {
+                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                    tab.buffer.text = updated;
+                    tab.buffer.dirty = true;
+                    tab.last_edit = Some(Instant::now());
+                }
+                self.status = format!("Replaced {count} matches");
+                self.refresh_editor_find_matches();
+            }
+            Ok(_) => {}
+            Err(error) => self.editor_find.error = Some(error.to_string()),
+        }
+    }
+
     fn close_tab_for_path(&mut self, path: &VaultPath) {
         let Some(index) = self
             .tabs
@@ -1410,6 +2058,7 @@ impl LatticeApp {
         };
         self.tabs.remove(index);
         self.active_tab = adjusted_active_tab(self.active_tab, index, self.tabs.len());
+        self.refresh_editor_find_matches();
     }
 
     fn update_tab_path_after_rename(&mut self, from: &VaultPath, to: &VaultPath) {
@@ -1427,7 +2076,7 @@ impl LatticeApp {
     }
 
     fn save_tab(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
         let Some(path) = tab.path().cloned() else {
@@ -1435,6 +2084,7 @@ impl LatticeApp {
         };
         let contents = tab.buffer.text.clone();
         let base_snapshot = tab.buffer.base_snapshot.clone();
+        tab.save_in_flight = true;
         let generation = self.workspace_generation;
         let job_id = self.next_workspace_job_id();
         self.status = format!("Saving {}", path.as_str());
@@ -1452,13 +2102,14 @@ impl LatticeApp {
         let Some(index) = self.active_tab else {
             return;
         };
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
         let Some(path) = tab.path().cloned() else {
             return;
         };
         let contents = tab.buffer.text.clone();
+        tab.save_in_flight = true;
         let generation = self.workspace_generation;
         let job_id = self.next_workspace_job_id();
         self.status = format!("Overwriting {}", path.as_str());
@@ -1495,21 +2146,30 @@ impl LatticeApp {
 
     fn run_autosave(&mut self) {
         let now = Instant::now();
-        let indexes: Vec<_> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, tab)| {
-                (tab.buffer.dirty
-                    && tab.conflict.is_none()
-                    && tab.last_edit.is_some_and(|last_edit| {
-                        now.duration_since(last_edit) >= AUTOSAVE_DEBOUNCE
-                    }))
-                .then_some(index)
-            })
-            .collect();
+        let mut indexes = Vec::new();
+        let mut next_due: Option<Duration> = None;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if !tab.buffer.dirty || tab.conflict.is_some() || tab.save_in_flight {
+                continue;
+            }
+            let Some(last_edit) = tab.last_edit else {
+                continue;
+            };
+            let elapsed = now.duration_since(last_edit);
+            if elapsed >= AUTOSAVE_DEBOUNCE {
+                indexes.push(index);
+            } else {
+                let wait = AUTOSAVE_DEBOUNCE - elapsed;
+                next_due = Some(next_due.map_or(wait, |due| due.min(wait)));
+            }
+        }
         for index in indexes {
             self.save_tab(index);
+        }
+        // Make sure a frame runs when the debounce elapses, even if the window
+        // is otherwise idle; egui only repaints on input by default.
+        if let Some(wait) = next_due {
+            self.egui_ctx.request_repaint_after(wait);
         }
     }
 
@@ -1645,6 +2305,35 @@ impl LatticeApp {
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme.clone();
         egui::Frame::new()
+            .fill(theme.bg_elev)
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.sidebar_view == SidebarView::Files, "Files")
+                        .on_hover_text("Explorer")
+                        .clicked()
+                    {
+                        self.sidebar_view = SidebarView::Files;
+                    }
+                    if ui
+                        .selectable_label(self.sidebar_view == SidebarView::Search, "Search")
+                        .on_hover_text("Search in files (Ctrl+Shift+F)")
+                        .clicked()
+                    {
+                        self.open_workspace_search(false);
+                    }
+                });
+            });
+        match self.sidebar_view {
+            SidebarView::Files => self.draw_files_sidebar(ui),
+            SidebarView::Search => self.draw_workspace_search_sidebar(ui),
+        }
+    }
+
+    fn draw_files_sidebar(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme.clone();
+        egui::Frame::new()
             .fill(theme.bg)
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
@@ -1721,6 +2410,310 @@ impl LatticeApp {
         }
     }
 
+    fn draw_workspace_search_sidebar(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme.clone();
+        let mut changed = false;
+        egui::Frame::new()
+            .fill(theme.bg)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("SEARCH")
+                            .size(10.5)
+                            .strong()
+                            .color(theme.text_faint),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Filters").size(10.5).color(
+                                        if self.workspace_search.show_filters {
+                                            theme.accent
+                                        } else {
+                                            theme.text_dim
+                                        },
+                                    ),
+                                )
+                                .selected(self.workspace_search.show_filters)
+                                .frame(false),
+                            )
+                            .on_hover_text("Toggle include and exclude filters")
+                            .clicked()
+                        {
+                            self.workspace_search.show_filters =
+                                !self.workspace_search.show_filters;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Replace").size(10.5).color(
+                                        if self.workspace_search.show_replace {
+                                            theme.accent
+                                        } else {
+                                            theme.text_dim
+                                        },
+                                    ),
+                                )
+                                .selected(self.workspace_search.show_replace)
+                                .frame(false),
+                            )
+                            .on_hover_text("Toggle replace controls")
+                            .clicked()
+                        {
+                            self.workspace_search.show_replace =
+                                !self.workspace_search.show_replace;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let toggle_width = 28.0;
+                    let input_width =
+                        (ui.available_width() - toggle_width * 3.0 - 12.0).max(80.0);
+                    let id = ui.make_persistent_id("workspace_search_query");
+                    let response = ui.add_sized(
+                        egui::vec2(input_width, 26.0),
+                        egui::TextEdit::singleline(&mut self.workspace_search.query)
+                            .id(id)
+                            .hint_text("Search workspace"),
+                    );
+                    if self.workspace_search.focus_pending {
+                        response.request_focus();
+                        self.workspace_search.focus_pending = false;
+                    }
+                    changed |= response.changed();
+                    if search_toggle(
+                        ui,
+                        &theme,
+                        self.workspace_search.case_sensitive,
+                        "Aa",
+                        "Match case",
+                    ) {
+                        self.workspace_search.case_sensitive =
+                            !self.workspace_search.case_sensitive;
+                        changed = true;
+                    }
+                    if search_toggle(
+                        ui,
+                        &theme,
+                        self.workspace_search.whole_word,
+                        "W",
+                        "Match whole word",
+                    ) {
+                        self.workspace_search.whole_word = !self.workspace_search.whole_word;
+                        changed = true;
+                    }
+                    if search_toggle(
+                        ui,
+                        &theme,
+                        self.workspace_search.use_regex,
+                        ".*",
+                        "Use regular expression",
+                    ) {
+                        self.workspace_search.use_regex = !self.workspace_search.use_regex;
+                        changed = true;
+                    }
+                });
+                if self.workspace_search.show_replace {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let button_width = 76.0;
+                        let input_width = (ui.available_width() - button_width - 4.0).max(80.0);
+                        ui.add_sized(
+                            egui::vec2(input_width, 26.0),
+                            egui::TextEdit::singleline(&mut self.workspace_search.replacement)
+                                .hint_text("Replace with"),
+                        );
+                        let enabled = self
+                            .workspace_search
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| !result.matches.is_empty())
+                            && !self.workspace_search.replace_pending;
+                        if ui
+                            .add_enabled(
+                                enabled,
+                                egui::Button::new("Replace All")
+                                    .min_size(egui::vec2(button_width, 26.0)),
+                            )
+                            .on_hover_text("Replace all matches")
+                            .clicked()
+                        {
+                            self.workspace_search.replace_confirmation = true;
+                        }
+                    });
+                }
+                if self.workspace_search.show_filters {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("FILES TO INCLUDE")
+                            .size(9.5)
+                            .color(theme.text_faint),
+                    );
+                    changed |= ui
+                        .add_sized(
+                            egui::vec2(ui.available_width(), 24.0),
+                            egui::TextEdit::singleline(&mut self.workspace_search.include_globs)
+                                .hint_text("e.g. *.rs, src/**"),
+                        )
+                        .changed();
+                    ui.label(
+                        egui::RichText::new("FILES TO EXCLUDE")
+                            .size(9.5)
+                            .color(theme.text_faint),
+                    );
+                    changed |= ui
+                        .add_sized(
+                            egui::vec2(ui.available_width(), 24.0),
+                            egui::TextEdit::singleline(&mut self.workspace_search.exclude_globs)
+                                .hint_text("e.g. tests/**, *.lock"),
+                        )
+                        .changed();
+                }
+            });
+
+        if changed {
+            self.schedule_workspace_search();
+        }
+
+        if self.workspace_search.replace_confirmation {
+            let (matches, files, truncated) = self
+                .workspace_search
+                .result
+                .as_ref()
+                .map(|result| {
+                    (
+                        result.matches.len(),
+                        result.files_with_matches,
+                        result.truncated,
+                    )
+                })
+                .unwrap_or_default();
+            egui::Frame::new()
+                .fill(theme.bg_elev_2)
+                .stroke(egui::Stroke::new(1.0, theme.warn))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    let message = if truncated {
+                        format!(
+                            "Replace every match in the workspace? The list shows only the \
+                             first {matches} matches across {files} files; replacement is \
+                             not limited to those."
+                        )
+                    } else {
+                        format!("Replace {matches} matches across {files} files?")
+                    };
+                    ui.label(message);
+                    ui.horizontal(|ui| {
+                        if ui.button("Replace All").clicked() {
+                            self.replace_workspace_matches(None);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.workspace_search.replace_confirmation = false;
+                        }
+                    });
+                });
+        }
+
+        if self.workspace_search.pending || self.workspace_search.replace_pending {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(13.0));
+                ui.label(
+                    egui::RichText::new(if self.workspace_search.replace_pending {
+                        "Replacing..."
+                    } else {
+                        "Searching..."
+                    })
+                    .size(11.0)
+                    .color(theme.text_dim),
+                );
+            });
+        }
+        if let Some(error) = &self.workspace_search.error {
+            ui.colored_label(theme.danger, error);
+        }
+
+        let mut open_match = None;
+        let mut toggle_file = None;
+        let mut replace_file = None;
+        if let Some(result) = &self.workspace_search.result {
+            let suffix = if result.truncated { " (limited)" } else { "" };
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} matches in {} files{suffix}  ·  {} ms",
+                    result.matches.len(),
+                    result.files_with_matches,
+                    result.elapsed_ms
+                ))
+                .size(10.5)
+                .color(theme.text_faint),
+            );
+            let matches = &result.matches;
+            let mut rows = Vec::with_capacity(matches.len() + result.files_with_matches);
+            let mut start = 0;
+            while start < matches.len() {
+                let path = &matches[start].path;
+                let mut end = start + 1;
+                while end < matches.len() && &matches[end].path == path {
+                    end += 1;
+                }
+                rows.push(SearchDisplayRow::File { start, end });
+                if self.workspace_search.expanded_files.contains(path) {
+                    rows.extend((start..end).map(SearchDisplayRow::Match));
+                }
+                start = end;
+            }
+
+            egui::ScrollArea::vertical().show_rows(ui, 26.0, rows.len(), |ui, visible| {
+                for row in &rows[visible] {
+                    match *row {
+                        SearchDisplayRow::File { start, end } => {
+                            let path = matches[start].path.clone();
+                            let expanded = self.workspace_search.expanded_files.contains(&path);
+                            let file_row = search_file_row(
+                                ui,
+                                &theme,
+                                &path,
+                                end - start,
+                                expanded,
+                                self.workspace_search.show_replace,
+                            );
+                            if file_row.toggle {
+                                toggle_file = Some(path.clone());
+                            }
+                            if file_row.replace {
+                                replace_file = Some(path);
+                            }
+                        }
+                        SearchDisplayRow::Match(index) => {
+                            let response = search_match_row(ui, &theme, &matches[index]);
+                            if response.clicked() {
+                                open_match = Some(matches[index].clone());
+                            }
+                        }
+                    }
+                }
+            });
+        } else if !self.workspace_search.query.is_empty() && !self.workspace_search.pending {
+            ui.label(egui::RichText::new("No results.").color(theme.text_dim));
+        }
+
+        if let Some(path) = toggle_file {
+            if !self.workspace_search.expanded_files.remove(&path) {
+                self.workspace_search.expanded_files.insert(path);
+            }
+        }
+        if let Some(path) = replace_file {
+            self.replace_workspace_matches(Some(BTreeSet::from([path])));
+        }
+        if let Some(matched) = open_match {
+            self.open_search_match(matched);
+        }
+    }
+
     fn apply_tree_action(&mut self, action: TreeAction) {
         match action {
             TreeAction::Select(path) => {
@@ -1757,6 +2750,7 @@ impl LatticeApp {
         }
         self.tabs.remove(index);
         self.active_tab = adjusted_active_tab(self.active_tab, index, self.tabs.len());
+        self.refresh_editor_find_matches();
     }
 }
 
@@ -1770,6 +2764,12 @@ enum TreeAction {
 enum EditorTabAction {
     Select(usize),
     Close(usize),
+}
+
+#[derive(Clone, Copy)]
+enum SearchDisplayRow {
+    File { start: usize, end: usize },
+    Match(usize),
 }
 
 struct TreeRenderCtx<'a> {
@@ -1907,6 +2907,127 @@ impl LatticeApp {
         self.draw_editor(ui);
     }
 
+    fn draw_editor_find(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let mut refresh = false;
+        let mut navigate = None;
+        let mut replace_current = false;
+        let mut replace_all = false;
+        egui::Frame::new()
+            .fill(theme.bg_elev)
+            .stroke(egui::Stroke::new(1.0, theme.border))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.editor_find.query)
+                            .id(ui.make_persistent_id("editor_find_query"))
+                            .hint_text("Find")
+                            .desired_width(240.0),
+                    );
+                    if self.editor_find.focus_pending {
+                        response.request_focus();
+                        self.editor_find.focus_pending = false;
+                    }
+                    refresh |= response.changed();
+                    if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        navigate = Some(if ui.input(|input| input.modifiers.shift) {
+                            -1
+                        } else {
+                            1
+                        });
+                    }
+                    let count = match (self.editor_find.current, self.editor_find.matches.len()) {
+                        (_, 0) => "No results".to_owned(),
+                        (Some(current), total) => format!("{} of {total}", current + 1),
+                        (None, total) => format!("{total} results"),
+                    };
+                    ui.label(
+                        egui::RichText::new(count)
+                            .size(10.5)
+                            .color(theme.text_faint),
+                    );
+                    if search_toggle(
+                        ui,
+                        theme,
+                        self.editor_find.case_sensitive,
+                        "Aa",
+                        "Match case",
+                    ) {
+                        self.editor_find.case_sensitive = !self.editor_find.case_sensitive;
+                        refresh = true;
+                    }
+                    if search_toggle(
+                        ui,
+                        theme,
+                        self.editor_find.whole_word,
+                        "W",
+                        "Match whole word",
+                    ) {
+                        self.editor_find.whole_word = !self.editor_find.whole_word;
+                        refresh = true;
+                    }
+                    if search_toggle(
+                        ui,
+                        theme,
+                        self.editor_find.use_regex,
+                        ".*",
+                        "Use regular expression",
+                    ) {
+                        self.editor_find.use_regex = !self.editor_find.use_regex;
+                        refresh = true;
+                    }
+                    if icon_button(ui, theme, "↑", "Previous match (Shift+Enter)").clicked() {
+                        navigate = Some(-1);
+                    }
+                    if icon_button(ui, theme, "↓", "Next match (Enter/F3)").clicked() {
+                        navigate = Some(1);
+                    }
+                    if icon_button(ui, theme, "↔", "Toggle replace").clicked() {
+                        self.editor_find.show_replace = !self.editor_find.show_replace;
+                    }
+                    if icon_button(ui, theme, "×", "Close").clicked() {
+                        self.editor_find.visible = false;
+                    }
+                });
+                if self.editor_find.show_replace {
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.editor_find.replacement)
+                                .hint_text("Replace")
+                                .desired_width(240.0),
+                        );
+                        if response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            replace_current = true;
+                        }
+                        if ui.button("Replace").clicked() {
+                            replace_current = true;
+                        }
+                        if ui.button("Replace All").clicked() {
+                            replace_all = true;
+                        }
+                    });
+                }
+                if let Some(error) = &self.editor_find.error {
+                    ui.colored_label(theme.danger, error);
+                }
+            });
+        if refresh {
+            self.refresh_editor_find_matches();
+        }
+        if let Some(delta) = navigate {
+            self.navigate_editor_find(delta);
+        }
+        if replace_current {
+            self.replace_current_editor_match();
+        }
+        if replace_all {
+            self.replace_all_editor_matches();
+        }
+    }
+
     fn draw_editor(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme.clone();
         if self.tabs.is_empty() {
@@ -1923,6 +3044,10 @@ impl LatticeApp {
         }
 
         self.draw_tab_bar(ui, &theme);
+
+        if self.editor_find.visible {
+            self.draw_editor_find(ui, &theme);
+        }
 
         let Some(index) = self.active_tab else {
             return;
@@ -1944,11 +3069,17 @@ impl LatticeApp {
             .unwrap_or("txt")
             .to_owned();
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-        let code_theme =
-            egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
+        let code_theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
 
+        let editor_id = self.editor_text_id(index);
         let tab = &mut self.tabs[index];
-        let line_count = tab.buffer.text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let line_count = tab
+            .buffer
+            .text
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
         if tab.gutter_lines != line_count {
             rebuild_gutter(&mut tab.gutter, line_count);
             tab.gutter_lines = line_count;
@@ -1989,6 +3120,7 @@ impl LatticeApp {
                         };
 
                     let mut edit = egui::TextEdit::multiline(&mut tab.buffer.text)
+                        .id(editor_id)
                         .code_editor()
                         .desired_width(f32::INFINITY)
                         .desired_rows(40)
@@ -1997,11 +3129,28 @@ impl LatticeApp {
                     if highlight_enabled {
                         edit = edit.layouter(&mut layouter);
                     }
-                    let output = edit.show(ui);
+                    let mut output = edit.show(ui);
                     if output.response.changed() {
                         changed = true;
                     }
                     cursor_index = output.cursor_range.map(|range| range.primary.index);
+                    if let Some((byte_start, byte_end)) = tab.pending_selection.take() {
+                        let start = byte_to_char_index(&tab.buffer.text, byte_start);
+                        let end = byte_to_char_index(&tab.buffer.text, byte_end);
+                        let range = egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(start),
+                            egui::text::CCursor::new(end),
+                        );
+                        output.state.cursor.set_char_range(Some(range));
+                        output.state.store(ui.ctx(), output.response.id);
+                        output.response.request_focus();
+                        let cursor_rect = output
+                            .galley
+                            .pos_from_cursor(egui::text::CCursor::new(end))
+                            .translate(output.galley_pos.to_vec2());
+                        ui.scroll_to_rect(cursor_rect.expand(24.0), Some(egui::Align::Center));
+                        cursor_index = Some(end);
+                    }
                 });
             });
 
@@ -2011,6 +3160,14 @@ impl LatticeApp {
             tab.last_edit = Some(Instant::now());
         }
         self.cursor_line_col = cursor_index.map(|char_index| line_col_at(&tab.buffer.text, char_index));
+        if changed {
+            self.refresh_editor_find_matches();
+            if self.sidebar_view == SidebarView::Search
+                && !self.workspace_search.query.trim().is_empty()
+            {
+                self.schedule_workspace_search();
+            }
+        }
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui, theme: &Theme) {
@@ -2104,6 +3261,7 @@ impl LatticeApp {
                         self.selected_path = Some(path.clone());
                         self.rename_target = path.as_str().to_owned();
                     }
+                    self.refresh_editor_find_matches();
                 }
                 EditorTabAction::Close(index) => self.close_tab(index),
             }
@@ -2232,6 +3390,23 @@ impl LatticeApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                if menu_item(ui, "Find", "Ctrl+F").clicked() {
+                    self.open_editor_find(false);
+                    ui.close();
+                }
+                if menu_item(ui, "Replace", "Ctrl+H").clicked() {
+                    self.open_editor_find(true);
+                    ui.close();
+                }
+                if menu_item(ui, "Find in Files", "Ctrl+Shift+F").clicked() {
+                    self.open_workspace_search(false);
+                    ui.close();
+                }
+                if menu_item(ui, "Replace in Files", "Ctrl+Shift+H").clicked() {
+                    self.open_workspace_search(true);
+                    ui.close();
+                }
+                ui.separator();
                 if menu_item(ui, "Rename/Move Selected", "").clicked() {
                     self.rename_selected();
                     ui.close();
@@ -2271,6 +3446,7 @@ impl LatticeApp {
             self.selected_path = Some(path.clone());
             self.rename_target = path.as_str().to_owned();
         }
+        self.refresh_editor_find_matches();
     }
 
     fn draw_quick_open_overlay(&mut self, ctx: &egui::Context) {
@@ -2594,6 +3770,237 @@ fn quiet_button(ui: &mut egui::Ui, theme: &Theme, text: &str) -> egui::Response 
     )
 }
 
+fn search_toggle(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    selected: bool,
+    text: &str,
+    tooltip: &str,
+) -> bool {
+    ui.add_sized(
+        egui::vec2(28.0, 24.0),
+        egui::Button::new(
+            egui::RichText::new(text)
+                .monospace()
+                .size(10.5)
+                .color(if selected { theme.accent } else { theme.text_dim }),
+        )
+        .selected(selected)
+        .fill(if selected {
+            theme.accent_soft
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .stroke(if selected {
+            egui::Stroke::new(1.0, theme.accent)
+        } else {
+            egui::Stroke::new(1.0, theme.border)
+        }),
+    )
+    .on_hover_text(tooltip)
+    .clicked()
+}
+
+struct SearchFileRowAction {
+    toggle: bool,
+    replace: bool,
+}
+
+fn search_file_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    path: &VaultPath,
+    match_count: usize,
+    expanded: bool,
+    show_replace: bool,
+) -> SearchFileRowAction {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 26.0),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(4), theme.bg_hover);
+    }
+
+    let inner = rect.shrink2(egui::vec2(6.0, 0.0));
+    let replace_width = if show_replace { 24.0 } else { 0.0 };
+    let count_width = 34.0;
+    let content_right = (inner.right() - count_width - replace_width).max(inner.left());
+    let content_rect = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(content_right, inner.bottom()),
+    );
+    let count_rect = egui::Rect::from_min_max(
+        egui::pos2(content_right, inner.top()),
+        egui::pos2(content_right + count_width, inner.bottom()),
+    );
+
+    let mut content_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    content_ui.spacing_mut().item_spacing.x = 4.0;
+    content_ui.add_sized(
+        egui::vec2(12.0, 24.0),
+        egui::Label::new(
+            egui::RichText::new(if expanded { "⌄" } else { "›" })
+                .size(12.0)
+                .color(theme.text_dim),
+        ),
+    );
+    let path_width = content_ui.available_width().max(0.0);
+    content_ui.add_sized(
+        egui::vec2(path_width, 24.0),
+        egui::Label::new(
+            egui::RichText::new(path.as_str())
+                .size(11.5)
+                .strong()
+                .color(theme.text),
+        )
+        .truncate(),
+    );
+
+    let mut count_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(count_rect)
+            .layout(egui::Layout::centered_and_justified(
+                egui::Direction::LeftToRight,
+            )),
+    );
+    count_ui.label(
+        egui::RichText::new(match_count.to_string())
+            .monospace()
+            .size(10.0)
+            .color(theme.text_faint),
+    );
+
+    let replace = if show_replace {
+        let replace_rect = egui::Rect::from_min_max(
+            egui::pos2(count_rect.right(), inner.top()),
+            inner.max,
+        );
+        ui.put(
+            replace_rect,
+            egui::Button::new(
+                egui::RichText::new("R")
+                    .monospace()
+                    .size(10.0)
+                    .color(theme.text_dim),
+            )
+            .frame(false),
+        )
+        .on_hover_text("Replace all matches in this file")
+        .clicked()
+    } else {
+        false
+    };
+
+    response.clone().on_hover_text(path.as_str());
+    SearchFileRowAction {
+        toggle: response.clicked() && !replace,
+        replace,
+    }
+}
+
+fn search_match_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    matched: &SearchMatch,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 26.0),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(4), theme.bg_hover);
+    }
+
+    let inner = rect.shrink2(egui::vec2(8.0, 0.0));
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    row_ui.spacing_mut().item_spacing.x = 7.0;
+    row_ui.add_sized(
+        egui::vec2(52.0, 22.0),
+        egui::Label::new(
+            egui::RichText::new(format!("{}:{}", matched.line_number, matched.column))
+                .monospace()
+                .size(9.5)
+                .color(theme.text_faint),
+        )
+        .truncate(),
+    );
+    row_ui.add_sized(
+        egui::vec2(row_ui.available_width().max(0.0), 22.0),
+        egui::Label::new(search_result_preview(matched, theme)).truncate(),
+    );
+
+    response.on_hover_text(format!(
+        "{}:{}:{}",
+        matched.path.as_str(),
+        matched.line_number,
+        matched.column
+    ))
+}
+
+fn search_result_preview(matched: &SearchMatch, theme: &Theme) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let base = egui::TextFormat {
+        font_id: egui::FontId::monospace(11.0),
+        color: theme.text_dim,
+        ..Default::default()
+    };
+    let highlighted = egui::TextFormat {
+        color: theme.text,
+        background: theme.accent_soft,
+        ..base.clone()
+    };
+    let start = matched.preview_match_start.min(matched.line_text.len());
+    let end = matched
+        .preview_match_end
+        .max(start)
+        .min(matched.line_text.len());
+    job.append(&matched.line_text[..start], 0.0, base.clone());
+    job.append(&matched.line_text[start..end], 0.0, highlighted);
+    job.append(&matched.line_text[end..], 0.0, base);
+    job
+}
+
+fn parse_globs(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|glob| !glob.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn byte_to_char_index(text: &str, byte_index: usize) -> usize {
+    let mut byte_index = byte_index.min(text.len());
+    while !text.is_char_boundary(byte_index) {
+        byte_index -= 1;
+    }
+    text[..byte_index].chars().count()
+}
+
+fn char_slice(text: &str, range: std::ops::Range<usize>) -> Option<&str> {
+    let start = char_to_byte_index(text, range.start)?;
+    let end = char_to_byte_index(text, range.end)?;
+    text.get(start..end)
+}
+
+fn char_to_byte_index(text: &str, char_index: usize) -> Option<usize> {
+    if char_index == text.chars().count() {
+        return Some(text.len());
+    }
+    text.char_indices().nth(char_index).map(|(index, _)| index)
+}
+
 fn icon_button(ui: &mut egui::Ui, theme: &Theme, text: &str, tooltip: &str) -> egui::Response {
     ui.add_sized(
         egui::vec2(18.0, 18.0),
@@ -2849,6 +4256,34 @@ impl LatticeApp {
 
 impl eframe::App for LatticeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let workspace_find = ui.input(|input| {
+            input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::F)
+        });
+        let workspace_replace = ui.input(|input| {
+            input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::H)
+        });
+        if workspace_find {
+            self.open_workspace_search(false);
+        } else if ui.input(|input| {
+            input.modifiers.ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::F)
+        }) {
+            self.open_editor_find(false);
+        }
+        if workspace_replace {
+            self.open_workspace_search(true);
+        } else if ui.input(|input| {
+            input.modifiers.ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::H)
+        }) {
+            self.open_editor_find(true);
+        }
+        if ui.input(|input| input.key_pressed(egui::Key::F3)) {
+            let delta = if ui.input(|input| input.modifiers.shift) {
+                -1
+            } else {
+                1
+            };
+            self.navigate_editor_find(delta);
+        }
         if ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::S)) {
             self.save_active_tab();
         }
@@ -2879,9 +4314,16 @@ impl eframe::App for LatticeApp {
             self.select_relative_tab(delta);
         }
         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.quick_open_overlay = false;
+            if self.quick_open_overlay {
+                self.quick_open_overlay = false;
+            } else if self.workspace_search.replace_confirmation {
+                self.workspace_search.replace_confirmation = false;
+            } else if self.editor_find.visible {
+                self.editor_find.visible = false;
+            }
         }
         self.drain_worker_responses();
+        self.process_pending_workspace_search();
         self.run_autosave();
         self.drain_watcher();
         self.process_pending_workspace_refresh();
@@ -3054,5 +4496,21 @@ mod tests {
             tree[0].kind,
             TreeNodeKind::DirectoryLoaded { ref children } if children.is_empty()
         ));
+    }
+
+    #[test]
+    fn parses_comma_separated_search_globs() {
+        assert_eq!(
+            parse_globs("*.rs, src/**, ,tests/*.toml"),
+            vec!["*.rs", "src/**", "tests/*.toml"]
+        );
+    }
+
+    #[test]
+    fn byte_and_char_search_offsets_handle_unicode() {
+        let text = "aåßz";
+        assert_eq!(byte_to_char_index(text, 0), 0);
+        assert_eq!(byte_to_char_index(text, 3), 2);
+        assert_eq!(char_slice(text, 1..3), Some("åß"));
     }
 }

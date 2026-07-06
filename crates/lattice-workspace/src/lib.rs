@@ -17,6 +17,13 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
+mod search;
+
+pub use search::{
+    find_text_matches, replace_all_text, replace_text_match, search_path_matches, SearchMatch,
+    SearchQuery, TextMatch, WorkspaceReplaceReport, WorkspaceSearchOptions, WorkspaceSearchResult,
+};
+
 pub const DEFAULT_IGNORES: &[&str] = &[
     ".git",
     ".lattice/history.git",
@@ -446,6 +453,50 @@ impl Workspace {
         Ok(QuickOpenIndex::rebuild(files))
     }
 
+    pub fn search_workspace<F>(
+        &self,
+        options: &WorkspaceSearchOptions,
+        is_cancelled: F,
+    ) -> Result<WorkspaceSearchResult>
+    where
+        F: Fn() -> bool + Sync,
+    {
+        search::search_workspace(self, options, is_cancelled)
+    }
+
+    pub fn search_workspace_with_open_files<F>(
+        &self,
+        options: &WorkspaceSearchOptions,
+        open_files: &[(VaultPath, String)],
+        is_cancelled: F,
+    ) -> Result<WorkspaceSearchResult>
+    where
+        F: Fn() -> bool + Sync,
+    {
+        search::search_workspace_with_open_files(self, options, open_files, is_cancelled)
+    }
+
+    pub fn replace_workspace<F>(
+        &self,
+        options: &WorkspaceSearchOptions,
+        replacement: &str,
+        include_paths: Option<&BTreeSet<VaultPath>>,
+        excluded_paths: &BTreeSet<VaultPath>,
+        is_cancelled: F,
+    ) -> Result<WorkspaceReplaceReport>
+    where
+        F: Fn() -> bool + Sync,
+    {
+        search::replace_workspace(
+            self,
+            options,
+            replacement,
+            include_paths,
+            excluded_paths,
+            is_cancelled,
+        )
+    }
+
     pub fn read_file(&self, path: &VaultPath) -> Result<String> {
         let (contents, _) = self.open_file(path)?;
         Ok(contents)
@@ -649,7 +700,19 @@ fn atomic_write(parent: &Dir, file_name: &OsStr, contents: &str) -> Result<()> {
     let mut temp_file = TempFile::new(parent)?;
     temp_file.write_all(contents.as_bytes())?;
     temp_file.as_file().sync_all()?;
+    // The temp file is created with default permissions; carry over the
+    // target's existing mode so e.g. executable scripts stay executable.
+    match parent.symlink_metadata(file_name) {
+        Ok(metadata) if metadata.is_file() => {
+            temp_file.as_file().set_permissions(metadata.permissions())?;
+        }
+        _ => {}
+    }
     temp_file.replace(file_name)?;
+    // Best effort: fsync the directory so the rename survives a crash.
+    if let Ok(dir) = parent.try_clone() {
+        let _ = dir.into_std_file().sync_all();
+    }
     Ok(())
 }
 
@@ -989,6 +1052,32 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_file_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_vault();
+        let workspace = Workspace::open_vault(root.clone()).unwrap();
+        let path = VaultPath::try_from("run.sh").unwrap();
+
+        workspace.create_file(&path, "#!/bin/sh\n").unwrap();
+        let script = root.join("run.sh");
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        workspace.save_file(&path, "#!/bin/sh\necho hi\n").unwrap();
+
+        let mode = fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(
+            fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

@@ -14,6 +14,7 @@ The core promise:
 - Syntax highlighting for common languages, line numbers, tabs, autosave.
 - Safe saves: atomic writes, external-change detection, conflict resolution.
 - Fuzzy quick open (Ctrl+P) over the whole workspace.
+- Find/replace in one file and parallel search/replace across the workspace.
 - No AI, no extensions, no network, no background services.
 
 ## Architecture
@@ -21,7 +22,7 @@ The core promise:
 A Rust workspace of small crates on `egui/eframe`:
 
 - `lattice-core` — path safety (`VaultPath` cannot escape the workspace root), settings.
-- `lattice-workspace` — capability-scoped (`cap-std`) file access, lazy directory tree, parallel gitignore-aware walker, fuzzy quick-open index, file watcher, atomic writes with content-hash snapshots.
+- `lattice-workspace` — capability-scoped (`cap-std`) file access, lazy directory tree, parallel gitignore-aware search/walking, fuzzy quick-open index, file watcher, atomic writes with content-hash snapshots.
 - `lattice-editor` — editor buffer model (dirty tracking, saved-snapshot hashes).
 - `lattice-ui` — theme tokens and bundled fonts.
 - `lattice-app` — the eframe app: sidebar tree + tabbed editor (egui_tiles), syntect highlighting, status bar, quick open, background worker thread for all I/O.
@@ -35,6 +36,7 @@ All filesystem work runs on a worker thread; the UI thread never blocks on I/O. 
 - Edit with syntax highlighting, line numbers, multiple tabs, autosave.
 - Save safely with atomic writes and conflict detection against external edits.
 - Quick-open any file with fuzzy search.
+- Search and replace in the editor or across gitignore-aware workspace files.
 
 ## Non-Goals
 

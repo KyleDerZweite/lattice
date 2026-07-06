@@ -38,6 +38,7 @@ ignore = "0.4"
 log = "0.4"
 notify = "8"
 png = "0.18"
+regex = "1"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

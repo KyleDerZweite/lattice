@@ -1,0 +1,4 @@
+- The ~millisecond TOCTOU window between the save conflict-check and the atomic rename — the standard editor tradeoff; closing it needs file locking and isn't worth the complexity.
+- Workspace search includes hidden files (like rg --hidden) while the tree and quick-open don't — looks intentional; say the word if you want them aligned.
+- The watcher never unwatches removed/collapsed directories (bounded per session).
+- The biggest remaining test gap is the app-level save/conflict decision tree in main.rs (save_file_in_worker, check_external_changes_in_worker) — both are thread-side pure functions and very testable if you want that hardened next.

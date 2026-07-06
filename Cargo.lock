@@ -2179,6 +2179,7 @@ dependencies = [
  "lattice-core",
  "log",
  "notify",
+ "regex",
 ]
 
 [[package]]
