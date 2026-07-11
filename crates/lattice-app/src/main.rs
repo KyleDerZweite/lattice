@@ -4416,6 +4416,36 @@ fn parse_settings(contents: &str) -> Result<AppSettings, toml::de::Error> {
 mod tests {
     use super::*;
 
+    struct TestWorkspace {
+        workspace: Workspace,
+        root: PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "lattice-app-test-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            let workspace = Workspace::open_vault(root.clone()).unwrap();
+            Self { workspace, root }
+        }
+
+        fn file(&self, path: &VaultPath, contents: &str) -> OpenFileSnapshot {
+            self.workspace.create_file(path, contents).unwrap();
+            self.workspace.file_snapshot(path).unwrap().unwrap()
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
     #[test]
     fn parse_settings_rejects_invalid_toml() {
         assert!(parse_settings("theme = {").is_err());
@@ -4512,5 +4542,164 @@ mod tests {
         assert_eq!(byte_to_char_index(text, 0), 0);
         assert_eq!(byte_to_char_index(text, 3), 2);
         assert_eq!(char_slice(text, 1..3), Some("åß"));
+    }
+
+    #[test]
+    fn save_worker_saves_against_unchanged_snapshot() {
+        let test = TestWorkspace::new();
+        let path = VaultPath::try_from("note.txt").unwrap();
+        let base = test.file(&path, "before");
+
+        let result = save_file_in_worker(
+            &test.workspace,
+            &path,
+            "after",
+            Some(base),
+            false,
+        )
+        .unwrap();
+
+        let SaveWorkerResult::Saved(snapshot) = result else {
+            panic!("an unchanged file should save");
+        };
+        assert_eq!(snapshot.content_hash, blake3::hash(b"after"));
+        assert_eq!(test.workspace.open_file(&path).unwrap().0, "after");
+    }
+
+    #[test]
+    fn save_worker_detects_external_change_and_accepts_identical_content() {
+        let test = TestWorkspace::new();
+        let path = VaultPath::try_from("note.txt").unwrap();
+        let base = test.file(&path, "base");
+        test.workspace.save_file(&path, "external").unwrap();
+
+        assert!(matches!(
+            save_file_in_worker(&test.workspace, &path, "local", Some(base.clone()), false),
+            Ok(SaveWorkerResult::Conflict)
+        ));
+        assert!(matches!(
+            save_file_in_worker(&test.workspace, &path, "external", Some(base), false),
+            Ok(SaveWorkerResult::Saved(_))
+        ));
+    }
+
+    #[test]
+    fn save_worker_requires_overwrite_to_recreate_deleted_file() {
+        let test = TestWorkspace::new();
+        let path = VaultPath::try_from("note.txt").unwrap();
+        let base = test.file(&path, "base");
+        test.workspace.delete_file(&path).unwrap();
+
+        assert!(matches!(
+            save_file_in_worker(&test.workspace, &path, "local", Some(base.clone()), false),
+            Ok(SaveWorkerResult::Deleted)
+        ));
+        assert!(matches!(
+            save_file_in_worker(&test.workspace, &path, "local", Some(base), true),
+            Ok(SaveWorkerResult::Saved(_))
+        ));
+        assert_eq!(test.workspace.open_file(&path).unwrap().0, "local");
+    }
+
+    #[test]
+    fn external_change_worker_reloads_clean_tabs_and_conflicts_dirty_tabs() {
+        let test = TestWorkspace::new();
+        let clean_path = VaultPath::try_from("clean.txt").unwrap();
+        let dirty_path = VaultPath::try_from("dirty.txt").unwrap();
+        let clean_base = test.file(&clean_path, "clean base");
+        let dirty_base = test.file(&dirty_path, "dirty base");
+        test.workspace.save_file(&clean_path, "disk clean").unwrap();
+        test.workspace.save_file(&dirty_path, "disk dirty").unwrap();
+
+        let changes = check_external_changes_in_worker(
+            &test.workspace,
+            vec![
+                ExternalTabState {
+                    index: 2,
+                    path: clean_path,
+                    base_snapshot: clean_base,
+                    dirty: false,
+                    content_hash: blake3::hash(b"clean base"),
+                },
+                ExternalTabState {
+                    index: 4,
+                    path: dirty_path,
+                    base_snapshot: dirty_base,
+                    dirty: true,
+                    content_hash: blake3::hash(b"local dirty"),
+                },
+            ],
+        );
+
+        assert!(matches!(
+            &changes[0],
+            ExternalTabChange::Reload { index: 2, contents, .. } if contents == "disk clean"
+        ));
+        assert!(matches!(
+            changes[1],
+            ExternalTabChange::Conflict {
+                index: 4,
+                conflict: FileConflict::ModifiedOnDisk,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn external_change_worker_handles_matching_and_deleted_tabs() {
+        let test = TestWorkspace::new();
+        let matching_path = VaultPath::try_from("matching.txt").unwrap();
+        let clean_deleted_path = VaultPath::try_from("clean-deleted.txt").unwrap();
+        let dirty_deleted_path = VaultPath::try_from("dirty-deleted.txt").unwrap();
+        let matching_base = test.file(&matching_path, "base");
+        let clean_deleted_base = test.file(&clean_deleted_path, "base");
+        let dirty_deleted_base = test.file(&dirty_deleted_path, "base");
+        test.workspace.save_file(&matching_path, "local edit").unwrap();
+        test.workspace.delete_file(&clean_deleted_path).unwrap();
+        test.workspace.delete_file(&dirty_deleted_path).unwrap();
+
+        let changes = check_external_changes_in_worker(
+            &test.workspace,
+            vec![
+                ExternalTabState {
+                    index: 0,
+                    path: matching_path,
+                    base_snapshot: matching_base,
+                    dirty: true,
+                    content_hash: blake3::hash(b"local edit"),
+                },
+                ExternalTabState {
+                    index: 1,
+                    path: clean_deleted_path,
+                    base_snapshot: clean_deleted_base,
+                    dirty: false,
+                    content_hash: blake3::hash(b"base"),
+                },
+                ExternalTabState {
+                    index: 2,
+                    path: dirty_deleted_path,
+                    base_snapshot: dirty_deleted_base,
+                    dirty: true,
+                    content_hash: blake3::hash(b"local edit"),
+                },
+            ],
+        );
+
+        assert!(matches!(
+            changes[0],
+            ExternalTabChange::MarkSaved { index: 0, .. }
+        ));
+        assert!(matches!(
+            changes[1],
+            ExternalTabChange::Close { index: 1, .. }
+        ));
+        assert!(matches!(
+            changes[2],
+            ExternalTabChange::Conflict {
+                index: 2,
+                conflict: FileConflict::DeletedOnDisk,
+                ..
+            }
+        ));
     }
 }
