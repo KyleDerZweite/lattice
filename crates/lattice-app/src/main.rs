@@ -1373,6 +1373,7 @@ impl LatticeApp {
     ) {
         match result {
             Ok((contents, snapshot)) => {
+                self.watch_file_parent(&path);
                 if let Some(index) = self
                     .tabs
                     .iter()
@@ -2900,6 +2901,27 @@ impl LatticeApp {
         let absolute = path.join_to(workspace.vault().root.as_path());
         if let Err(error) = watcher.watch_path(&absolute) {
             log::warn!("failed to watch expanded path {}: {error}", path.as_str());
+        }
+    }
+
+    /// Open files must receive external-change events even when their directory
+    /// was reached through quick-open or the CLI and is still collapsed in the
+    /// tree. The workspace root is already watched; nested files need their
+    /// immediate parent watched because the watcher is intentionally
+    /// non-recursive.
+    fn watch_file_parent(&mut self, path: &VaultPath) {
+        let (Some(workspace), Some(watcher)) = (&self.workspace, &mut self.watcher) else {
+            return;
+        };
+        let absolute = path.join_to(workspace.vault().root.as_path());
+        let Some(parent) = absolute.parent() else {
+            return;
+        };
+        if let Err(error) = watcher.watch_path(parent) {
+            log::warn!(
+                "failed to watch parent of open file {}: {error}",
+                path.as_str()
+            );
         }
     }
 

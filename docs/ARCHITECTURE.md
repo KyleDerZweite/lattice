@@ -48,7 +48,7 @@ snapshot and surface a conflict instead of clobbering external edits.
 - Syntax highlighting is memoized by egui and skipped entirely above 1 MiB.
 - Files over 10 MB show a slow-edit warning.
 - The directory tree loads lazily per expanded directory; the watcher watches
-  only the root and expanded directories, non-recursively.
+  the root, expanded directories, and parents of open files non-recursively.
 - Tree refreshes and external-change checks are debounced (250 ms).
 - Workspace content search is debounced (180 ms), cancellable, bounded to
   10,000 displayed matches, and skips binary or larger-than-20-MiB files.
