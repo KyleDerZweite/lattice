@@ -1,6 +1,6 @@
 # Lattice
 
-A fast, minimal, native code editor. One ~17 MB binary, no Electron, no AI,
+A minimal, native code editor. One binary, no Electron, no AI,
 no extensions, no telemetry, no network.
 
 ## Features
@@ -14,8 +14,10 @@ no extensions, no telemetry, no network.
 - File watcher: external changes show up live
 - Dark/light theme, bundled fonts — looks the same everywhere
 
-All file I/O runs on a background thread; the UI never blocks. Workspace open
-plus full file indexing takes milliseconds.
+Workspace file I/O runs on background threads, with exceptions described in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#threading-model). The earlier claims of
+an approximately 17 MB binary and millisecond workspace opening and indexing
+remain unverified for this preserved prototype.
 
 ## Install
 
